@@ -12,6 +12,7 @@ from config import PRODUCTS
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SUPPORT = os.getenv("SUPPORT_USERNAME", "YourSupportUsername").strip()
+BINANCE_PAY_ID = os.getenv("BINANCE_PAY_ID", "").strip()
 ADMIN_IDS = {
     int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",")
     if x.strip().isdigit()
@@ -120,35 +121,67 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("buy:"):
-        pid = data[4:]
-        p = PRODUCTS[pid]
-        order_id = db.create_order(u.id, pid, 1, p["price"])
-        text = (
-            f"🧾 ORDER #{order_id}\n\n"
-            f"🏷 {p['name']}\n"
-            f"💰 Total: ${p['price']:.2f}\n\n"
-            "💳 Select payment method:"
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🟡 Binance Pay", callback_data=f"paybin:{order_id}")],
-            [InlineKeyboardButton("🔵 USDT — TRC20", callback_data=f"paytrc:{order_id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="home")]
-        ])
-        await q.edit_message_text(text, reply_markup=kb)
-        return
+    pid = data[4:]
+    p = PRODUCTS[pid]
 
-    if data.startswith("paybin:") or data.startswith("paytrc:"):
-        method = "Binance Pay" if data.startswith("paybin:") else "USDT TRC20"
-        order_id = data.split(":")[1]
-        await q.edit_message_text(
-            f"🧾 ORDER #{order_id}\n\n"
-            f"💳 Payment: {method}\n\n"
-            "Payment integration is not enabled in V1 yet.\n"
-            "Your order is saved as PENDING.\n\n"
-            "The next version will connect official payment verification.",
-            reply_markup=back_button()
-        )
-        return
+    order_id = db.create_order(
+        u.id,
+        pid,
+        1,
+        p["price"],
+        "Binance Pay"
+    )
+
+    text = (
+        f"🧾 ORDER #{order_id}\n\n"
+        f"📦 Product: {p['name']}\n"
+        f"💵 Total: ${p['price']:.2f}\n\n"
+        "💳 Payment Method\n"
+        "🟡 Binance Pay\n\n"
+        "Click the button below to view payment details."
+    )
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "🟡 Binance Pay",
+            callback_data=f"paybin:{order_id}"
+        )],
+        [InlineKeyboardButton(
+            "❌ Cancel",
+            callback_data="home"
+        )]
+    ])
+
+    await q.edit_message_text(text, reply_markup=kb)
+    return
+
+
+if data.startswith("paybin:"):
+    order_id = data.split(":")[1]
+
+    text = (
+        f"🟡 BINANCE PAY\n\n"
+        f"🧾 Order ID: #{order_id}\n\n"
+        f"💰 Please pay the exact order amount using Binance Pay.\n\n"
+        f"🆔 Binance Pay ID:\n"
+        f"{BINANCE_PAY_ID}\n\n"
+        "After completing the payment, click:\n"
+        "✅ I Have Paid"
+    )
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "✅ I Have Paid",
+            callback_data=f"paid:{order_id}"
+        )],
+        [InlineKeyboardButton(
+            "❌ Cancel",
+            callback_data="home"
+        )]
+    ])
+
+    await q.edit_message_text(text, reply_markup=kb)
+    return
 
     if data == "orders":
         rows = db.get_orders(u.id)
