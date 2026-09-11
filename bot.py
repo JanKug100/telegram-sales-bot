@@ -29,13 +29,14 @@ db.init_db()
 
 
 def main_menu():
+    # Native Telegram inline menu: stable 2-column layout.
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧑‍💼 My Profile", callback_data="profile")],
-        [InlineKeyboardButton("🛍️ Buy Products", callback_data="products")],
-        [InlineKeyboardButton("📦 My Orders", callback_data="orders")],
-        [InlineKeyboardButton("💰 Payment Methods", callback_data="payments")],
-        [InlineKeyboardButton("👥 Refer", callback_data="refer")],
-        [InlineKeyboardButton("🎧 Support", callback_data="support")],
+        [InlineKeyboardButton("🧑‍💼 My Profile", callback_data="profile"),
+         InlineKeyboardButton("🛍️ BUY PRODUCTS", callback_data="products")],
+        [InlineKeyboardButton("📦 MY ORDERS", callback_data="orders"),
+         InlineKeyboardButton("💳 ADD BALANCE", callback_data="payments")],
+        [InlineKeyboardButton("👥 REFER", callback_data="refer"),
+         InlineKeyboardButton("🎧 SUPPORT", callback_data="support")],
     ])
 
 
@@ -57,10 +58,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     referred_by = None
 
-    if context.args and context.args[0].isdigit():
-        candidate = int(context.args[0])
-        if candidate != u.id:
-            referred_by = candidate
+    if context.args:
+        raw_ref = str(context.args[0])
+        if raw_ref.startswith("ref_"):
+            raw_ref = raw_ref[4:]
+        if raw_ref.isdigit():
+            candidate = int(raw_ref)
+            if candidate != u.id:
+                referred_by = candidate
 
     db.upsert_user(u.id, u.full_name, u.username, referred_by)
 
@@ -201,26 +206,70 @@ def purchase_from_balance(order_id, user_id, product_id, total):
         }, "DELIVERED"
 
 
-async def send_delivery(context, order, product, delivery):
-    text = (
-        "🎉 DELIVERY SUCCESSFUL!\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        f"🧾 Order ID: #{order['order_id']}\n"
-        f"📦 Item: {product['name']}\n"
-        f"🏷 Category: {product['category']}\n"
-        f"🔢 Quantity: {order['quantity']}\n"
-        f"💰 Total Price: ${order['total']:.2f}\n\n"
-        "📧 Email / Username:\n"
-        f"{delivery['email']}\n\n"
-        "🔑 Password:\n"
-        f"{delivery['password']}\n\n"
-        + (f"💳 Remaining Balance: ${delivery['new_balance']:.2f}\n\n" if 'new_balance' in delivery else "")
-        + f"🕒 {delivery['delivered_at']}"
-    )
+async def send_delivery(context, order, product, deliveries):
+    if isinstance(deliveries, dict):
+        deliveries = [deliveries]
+    lines = [
+        "🎉 DELIVERY SUCCESSFUL!",
+        "━━━━━━━━━━━━━━━━",
+        f"🧾 Order ID: #{order['order_id']}",
+        f"📦 Item: {product['name']}",
+        f"🏷 Category: {product['category']}",
+        f"🔢 Quantity: {order['quantity']}",
+        f"💰 Total Price: ${order['total']:.2f}",
+        "",
+    ]
+    for i, item in enumerate(deliveries, 1):
+        lines += [f"{i}. 📧 Email / Username: {item['email']}", f"🔑 Password: {item['password']}", ""]
+    if deliveries and "new_balance" in deliveries[0]:
+        lines.append(f"💳 Remaining Balance: ${deliveries[0]['new_balance']:.2f}")
+    if deliveries:
+        lines.append(f"🕒 {deliveries[-1].get('delivered_at','')}")
+    await context.bot.send_message(chat_id=order["user_id"], text="\n".join(lines))
 
-    await context.bot.send_message(
-        chat_id=order["user_id"],
-        text=text,
+
+async def process_purchase(q, context, u, pid, qty):
+    p = PRODUCTS.get(pid)
+    if not p or not p.get("active", 1) or p.get("coming_soon"):
+        await q.edit_message_text("❌ Product unavailable.", reply_markup=back_button())
+        return
+    if qty < 1:
+        await q.edit_message_text("❌ Quantity must be at least 1.", reply_markup=back_button())
+        return
+    stock = db.get_product_stock(pid)
+    if qty > stock:
+        await q.edit_message_text(
+            f"❌ NOT ENOUGH STOCK\\n\\nRequested: {qty}\\nAvailable: {stock}\\n\\nContact @{SUPPORT.lstrip('@')}.",
+            reply_markup=back_button(),
+        )
+        return
+    total = round(float(p["price"]) * qty, 2)
+    user = db.get_user(u.id)
+    if not user:
+        db.upsert_user(u.id, u.full_name, u.username, None)
+        user = db.get_user(u.id)
+    if float(user["balance"]) + 1e-9 >= total:
+        order_id = db.create_order(u.id, pid, qty, total, "Balance")
+        order = get_order(order_id)
+        deliveries, result = purchase_from_balance_qty(order_id, u.id, pid, qty, total)
+        if result == "DELIVERED":
+            await send_delivery(context, order, p, deliveries)
+            await q.edit_message_text(
+                f"✅ PURCHASE COMPLETED\\n\\nOrder: #{order_id}\\nQuantity: {qty}\\n"
+                f"Total: ${total:.2f}\\nRemaining Balance: ${deliveries[0]['new_balance']:.2f}",
+                reply_markup=back_button(),
+            )
+            return
+        update_order_status(order_id, "OUT_OF_STOCK" if result == "OUT_OF_STOCK" else "CANCELLED")
+    order_id = db.create_order(u.id, pid, qty, total, "Binance Pay")
+    await q.edit_message_text(
+        f"🧾 ORDER #{order_id}\\n\\n📦 Product: {p['name']}\\n🔢 Quantity: {qty}\\n"
+        f"💵 Total: ${total:.2f}\\n💳 Balance: ${float(user['balance']):.2f}\\n\\n"
+        "Please pay the full amount using Binance Pay.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🟡 Binance Pay", callback_data=f"paybin:{order_id}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="home")],
+        ]),
     )
 
 
@@ -239,7 +288,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         refs = db.get_ref_count(u.id)
         username = f"@{user['username']}" if user["username"] else "@N/A"
         bot = await context.bot.get_me()
-        ref_link = f"https://t.me/{bot.username}?start={u.id}"
+        ref_link = f"https://t.me/{bot.username}?start=ref_{u.id}"
 
         text = (
             "👤 ACCOUNT DASHBOARD\n"
@@ -268,20 +317,35 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("cat:"):
         cat = data[4:]
-        rows = []
+        groups = []
         for pid, p in PRODUCTS.items():
             if p["category"] == cat:
-                rows.append([
-                    InlineKeyboardButton(
-                        f"{p['name']} — ${p['price']:.2f}",
-                        callback_data="product:" + pid,
-                    )
-                ])
+                g = p.get("group_name") or "Other"
+                if g not in groups:
+                    groups.append(g)
+        if len(groups) <= 1:
+            rows = []
+            for pid, p in PRODUCTS.items():
+                if p["category"] == cat:
+                    label = "⏳ " + p["name"] if p.get("coming_soon") else f"{p['name']} — ${p['price']:.2f}"
+                    rows.append([InlineKeyboardButton(label, callback_data="product:" + pid)])
+            rows.append([InlineKeyboardButton("⬅️ Back", callback_data="products")])
+            await q.edit_message_text(f"🛍️ {cat}", reply_markup=InlineKeyboardMarkup(rows))
+            return
+        rows = [[InlineKeyboardButton(g, callback_data=f"group:{cat}|{g}")] for g in groups]
         rows.append([InlineKeyboardButton("⬅️ Back", callback_data="products")])
-        await q.edit_message_text(
-            f"🛍️ {cat}",
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
+        await q.edit_message_text(f"🛍️ {cat}\n\nSelect a group:", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data.startswith("group:"):
+        cat, group = data[6:].split("|", 1)
+        rows = []
+        for pid, p in PRODUCTS.items():
+            if p["category"] == cat and (p.get("group_name") or "Other") == group:
+                label = "⏳ " + p["name"] if p.get("coming_soon") else f"{p['name']} — ${p['price']:.2f}"
+                rows.append([InlineKeyboardButton(label, callback_data="product:" + pid)])
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="cat:" + cat)])
+        await q.edit_message_text(f"🛍️ {group}", reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if data.startswith("product:"):
@@ -290,90 +354,45 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not p:
             await q.edit_message_text("Product not found.", reply_markup=back_button())
             return
-
-        text = (
-            f"🛍️ {p['name']}\n\n"
-            f"💰 Price: ${p['price']:.2f}\n"
-            "🔢 Quantity: 1\n\n"
-            "Choose an action:"
-        )
+        if p.get("coming_soon") or not p.get("active", 1):
+            await q.edit_message_text("⏳ COMING SOON\n\nThis product is not available yet.", reply_markup=back_button())
+            return
+        stock = db.get_product_stock(pid)
+        if stock <= 0:
+            await q.edit_message_text(f"❌ OUT OF STOCK\n\nContact @{SUPPORT.lstrip('@')} for help.", reply_markup=back_button())
+            return
+        text = (f"🛍️ {p['name']}\n\n💰 Price: ${p['price']:.2f} each\n"
+                f"📦 Available: {stock}\n\nSelect quantity:")
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🛒 Buy — $%.2f" % p["price"], callback_data="buy:" + pid)],
+            [InlineKeyboardButton("1", callback_data=f"qty:{pid}:1"),
+             InlineKeyboardButton("2", callback_data=f"qty:{pid}:2"),
+             InlineKeyboardButton("5", callback_data=f"qty:{pid}:5"),
+             InlineKeyboardButton("10", callback_data=f"qty:{pid}:10")],
+            [InlineKeyboardButton("✏️ Custom Quantity", callback_data=f"customqty:{pid}")],
             [InlineKeyboardButton("⬅️ Back", callback_data="cat:" + p["category"])],
         ])
         await q.edit_message_text(text, reply_markup=kb)
         return
 
+    if data.startswith("customqty:"):
+        pid = data.split(":", 1)[1]
+        context.user_data["awaiting_qty"] = pid
+        await q.edit_message_text("✏️ Send the quantity as a whole number.\n\nExample: 7", reply_markup=back_button())
+        return
+
+    if data.startswith("qty:"):
+        _, pid, qty_raw = data.split(":", 2)
+        try:
+            qty = int(qty_raw)
+        except ValueError:
+            await q.edit_message_text("❌ Invalid quantity.", reply_markup=back_button())
+            return
+        await process_purchase(q, context, u, pid, qty)
+        return
+
     if data.startswith("buy:"):
         pid = data[4:]
-        p = PRODUCTS.get(pid)
-        if not p:
-            await q.edit_message_text("Product not found.", reply_markup=back_button())
-            return
-
-        user = db.get_user(u.id)
-        if not user:
-            db.upsert_user(u.id, u.full_name, u.username, None)
-            user = db.get_user(u.id)
-
-        # Enough balance: create order, debit balance and deliver immediately.
-        if float(user["balance"]) + 1e-9 >= float(p["price"]):
-            order_id = db.create_order(u.id, pid, 1, p["price"], "Balance")
-            order = get_order(order_id)
-            delivery, result = purchase_from_balance(order_id, u.id, pid, p["price"])
-
-            if result == "DELIVERED":
-                try:
-                    await send_delivery(context, order, p, delivery)
-                except Exception as e:
-                    print(f"Delivery notification error: {e}")
-                await q.edit_message_text(
-                    "✅ PURCHASE COMPLETED\n"
-                    "━━━━━━━━━━━━━━━━\n\n"
-                    f"🧾 Order ID: #{order_id}\n"
-                    f"📦 Product: {p['name']}\n"
-                    f"💳 Paid from Balance: ${p['price']:.2f}\n"
-                    f"💰 Remaining Balance: ${delivery['new_balance']:.2f}\n\n"
-                    "📦 Your product has been delivered.",
-                    reply_markup=back_button(),
-                )
-                return
-
-            if result == "OUT_OF_STOCK":
-                update_order_status(order_id, "OUT_OF_STOCK")
-                await q.edit_message_text(
-                    "⚠️ OUT OF STOCK\n\n"
-                    "This product is currently unavailable. Your balance was not charged.",
-                    reply_markup=back_button(),
-                )
-                return
-
-            if result != "INSUFFICIENT_BALANCE":
-                update_order_status(order_id, "CANCELLED")
-                await q.edit_message_text(
-                    "❌ Purchase failed. Your balance was not charged.",
-                    reply_markup=back_button(),
-                )
-                return
-
-            # Race-safe fallback: if balance changed before the transaction, use Binance Pay.
-            update_order_status(order_id, "CANCELLED")
-
-        order_id = db.create_order(u.id, pid, 1, p["price"], "Binance Pay")
-        user = db.get_user(u.id)
-        text = (
-            f"🧾 ORDER #{order_id}\n\n"
-            f"📦 Product: {p['name']}\n"
-            f"💵 Total: ${p['price']:.2f}\n"
-            f"💳 Your Balance: ${user['balance']:.2f}\n\n"
-            "Your balance is not enough for this purchase.\n"
-            "Please pay the full amount using Binance Pay."
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🟡 Binance Pay", callback_data=f"paybin:{order_id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="home")],
-        ])
-        await q.edit_message_text(text, reply_markup=kb)
+        await process_purchase(q, context, u, pid, 1)
         return
 
     if data.startswith("paybin:"):
@@ -755,7 +774,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "refer":
         bot = await context.bot.get_me()
-        link = f"https://t.me/{bot.username}?start={u.id}"
+        link = f"https://t.me/{bot.username}?start=ref_{u.id}"
         refs = db.get_ref_count(u.id)
         user = db.get_user(u.id)
 
@@ -780,6 +799,20 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("awaiting_qty"):
+        pid = context.user_data.pop("awaiting_qty")
+        try:
+            qty = int(update.message.text.strip())
+        except ValueError:
+            await update.message.reply_text("❌ Invalid quantity. Send a whole number, e.g. 5.")
+            return
+        qmsg = update.message
+        class QWrap:
+            from_user = qmsg.from_user
+            async def edit_message_text(self, *args, **kwargs):
+                return await qmsg.reply_text(*args, **kwargs)
+        await process_purchase(QWrap(), context, update.effective_user, pid, qty)
+        return
     if not context.user_data.get("awaiting_balance_amount"):
         return
     raw = update.message.text.strip().replace(",", "")

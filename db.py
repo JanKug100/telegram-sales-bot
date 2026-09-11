@@ -175,3 +175,33 @@ def approve_balance_request(request_id):
         ).fetchone()["balance"]
         con.commit()
         return float(new_balance)
+
+
+def get_product_stock(product_id):
+    with closing(connect()) as con:
+        row = con.execute("SELECT COUNT(*) AS c FROM inventory WHERE product_id=? AND status='AVAILABLE'", (product_id,)).fetchone()
+        return int(row["c"]) if row else 0
+
+def purchase_from_balance_qty(order_id, user_id, product_id, qty, total):
+    with closing(connect()) as con:
+        con.execute("BEGIN IMMEDIATE")
+        order = con.execute("SELECT status FROM orders WHERE order_id=? AND user_id=?", (order_id,user_id)).fetchone()
+        user = con.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if not order or not user or float(user["balance"]) + 1e-9 < float(total):
+            con.rollback(); return [], "INSUFFICIENT_BALANCE"
+        items = con.execute("SELECT id,email,password FROM inventory WHERE product_id=? AND status='AVAILABLE' ORDER BY id LIMIT ?", (product_id, qty)).fetchall()
+        if len(items) < qty:
+            con.rollback(); return [], "OUT_OF_STOCK"
+        now = __import__('datetime').datetime.now().strftime("%Y-%m-%d %I:%M %p")
+        for item in items:
+            cur = con.execute("UPDATE inventory SET status='SOLD', sold_to=?, sold_at=? WHERE id=? AND status='AVAILABLE'", (user_id, now, item["id"]))
+            if cur.rowcount != 1:
+                con.rollback(); return [], "RESERVATION_FAILED"
+            con.execute("INSERT INTO orders(order_id,user_id,product_id,quantity,total,payment_method,status) VALUES(?,?,?,?,?,?,?) ON CONFLICT(order_id) DO NOTHING", (order_id,user_id,product_id,qty,total,'Balance','DELIVERED')) if False else None
+        cur = con.execute("UPDATE users SET balance=balance-? WHERE user_id=? AND balance>=?", (float(total), user_id, float(total)))
+        if cur.rowcount != 1:
+            con.rollback(); return [], "INSUFFICIENT_BALANCE"
+        con.execute("UPDATE orders SET status='DELIVERED', payment_method='Balance' WHERE order_id=?", (order_id,))
+        new_balance = float(con.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()["balance"])
+        con.commit()
+        return [{"email":r["email"],"password":r["password"],"delivered_at":now,"new_balance":new_balance} for r in items], "DELIVERED"
