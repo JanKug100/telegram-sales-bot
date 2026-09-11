@@ -1,4 +1,4 @@
-sales_bot.db
-.env
 __pycache__/
 *.pyc
+.env
+sales_bot.db

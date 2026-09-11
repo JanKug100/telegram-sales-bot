@@ -1,1056 +1,463 @@
-import os
-import sqlite3
+import os, asyncio, logging
 from datetime import datetime
-from contextlib import closing
-
-from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
-
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 import db
-from config import PRODUCTS
 
-load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log=logging.getLogger("jankug-v3")
 
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
-SUPPORT = os.getenv("SUPPORT_USERNAME", "YourSupportUsername").strip()
-BINANCE_PAY_ID = os.getenv("BINANCE_PAY_ID", "").strip()
+TOKEN=os.getenv("BOT_TOKEN","").strip()
+ADMIN_IDS={int(x) for x in os.getenv("ADMIN_IDS","").replace(","," ").split() if x.strip().isdigit()}
+SUPPORT=os.getenv("SUPPORT_USERNAME",db.setting("SUPPORT_USERNAME","@JanKug")).strip()
+BINANCE_PAY_ID=os.getenv("BINANCE_PAY_ID","").strip()
 
-def load_admin_ids():
-    raw = os.getenv("ADMIN_IDS", "")
-    ids = set()
-    for part in raw.replace(",", " ").split():
-        try:
-            ids.add(int(part.strip()))
-        except (TypeError, ValueError):
-            pass
-    return ids
+def admins():
+    global ADMIN_IDS
+    ADMIN_IDS={int(x) for x in os.getenv("ADMIN_IDS","").replace(","," ").split() if x.strip().isdigit()}
+    return ADMIN_IDS
 
+def is_admin(uid): return uid in admins()
+def money(x): return f"${float(x):.2f}"
 
-def get_admin_ids():
-    # Reload on every admin command so Railway variable changes are picked up
-    # after a restart without relying on a stale module-level value.
-    return load_admin_ids()
+def main_kb():
+    rows={}
+    for b in db.get_button_settings():
+        rows.setdefault(b["row_no"],[]).append(InlineKeyboardButton(b["text"],callback_data={
+            "profile":"profile","products":"products","orders":"orders","balance":"balance","refer":"refer","support":"support"
+        }.get(b["key"],"home")))
+    return InlineKeyboardMarkup([rows[k] for k in sorted(rows)])
 
+def back(data="home"): return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back",callback_data=data)]])
 
-def is_admin(user_id):
-    return int(user_id) in get_admin_ids()
-
-
-ADMIN_IDS = load_admin_ids()
-
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing. Put it in Railway Variables.")
-
-db.init_db()
-
-
-def main_menu():
-    # Native Telegram inline menu: stable 2-column layout.
+def admin_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧑‍💼 My Profile", callback_data="profile"),
-         InlineKeyboardButton("🛍️ BUY PRODUCTS", callback_data="products")],
-        [InlineKeyboardButton("📦 MY ORDERS", callback_data="orders"),
-         InlineKeyboardButton("💳 ADD BALANCE", callback_data="payments")],
-        [InlineKeyboardButton("👥 REFER", callback_data="refer"),
-         InlineKeyboardButton("🎧 SUPPORT", callback_data="support")],
+        [InlineKeyboardButton("📊 Dashboard",callback_data="ad:dashboard"),InlineKeyboardButton("💰 24h Sales",callback_data="ad:sales24")],
+        [InlineKeyboardButton("🛍️ Products",callback_data="ad:products"),InlineKeyboardButton("📦 Inventory",callback_data="ad:inventory")],
+        [InlineKeyboardButton("💰 Payments",callback_data="ad:payments"),InlineKeyboardButton("💳 Payment Methods",callback_data="ad:paymethods")],
+        [InlineKeyboardButton("💵 Balance Requests",callback_data="ad:balances"),InlineKeyboardButton("🧾 Orders",callback_data="ad:orders")],
+        [InlineKeyboardButton("👥 Users",callback_data="ad:users"),InlineKeyboardButton("🎁 Referrals",callback_data="ad:refs")],
+        [InlineKeyboardButton("⚙️ Settings",callback_data="ad:settings"),InlineKeyboardButton("🎛️ Button Manager",callback_data="ad:buttons")],
+        [InlineKeyboardButton("📢 Broadcast",callback_data="ad:broadcast"),InlineKeyboardButton("🎧 Support",callback_data="ad:support")],
+        [InlineKeyboardButton("🏠 Main Menu",callback_data="home")]
     ])
 
-
-def back_button():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Main Menu", callback_data="home")]
-    ])
-
-
-def balance_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add Balance", callback_data="add_balance")],
-        [InlineKeyboardButton("💳 My Balance", callback_data="show_balance")],
-        [InlineKeyboardButton("⬅️ Main Menu", callback_data="home")],
-    ])
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    referred_by = None
-
-    if context.args:
-        raw_ref = str(context.args[0])
-        if raw_ref.startswith("ref_"):
-            raw_ref = raw_ref[4:]
-        if raw_ref.isdigit():
-            candidate = int(raw_ref)
-            if candidate != u.id:
-                referred_by = candidate
-
-    db.upsert_user(u.id, u.full_name, u.username, referred_by)
-
-    await update.message.reply_text(
-        "🏠 MAIN MENU\n"
-        "━━━━━━━━━━━━━━━━\n"
-        "Welcome to the store!\n\n"
-        "Choose an option below.",
-        reply_markup=main_menu(),
-    )
-
-
-def get_order(order_id):
-    with closing(db.connect()) as con:
-        return con.execute(
-            "SELECT * FROM orders WHERE order_id = ?",
-            (order_id,),
-        ).fetchone()
-
-
-def update_order_status(order_id, status):
-    with closing(db.connect()) as con:
-        con.execute(
-            "UPDATE orders SET status = ? WHERE order_id = ?",
-            (status, order_id),
-        )
-        con.commit()
-
-
-def deliver_one_item(order_id, user_id, product_id):
-    """Atomically reserve one available inventory item for this order."""
-    with closing(db.connect()) as con:
-        con.execute("BEGIN IMMEDIATE")
-
-        order = con.execute(
-            "SELECT status, quantity FROM orders WHERE order_id = ?",
-            (order_id,),
-        ).fetchone()
-
-        if not order:
-            con.rollback()
-            return None, "ORDER_NOT_FOUND"
-
-        if order["status"] == "DELIVERED":
-            con.rollback()
-            return None, "ALREADY_DELIVERED"
-
-        item = con.execute(
-            """
-            SELECT id, email, password
-            FROM inventory
-            WHERE product_id = ? AND status = 'AVAILABLE'
-            ORDER BY id ASC
-            LIMIT 1
-            """,
-            (product_id,),
-        ).fetchone()
-
-        if not item:
-            con.rollback()
-            return None, "OUT_OF_STOCK"
-
-        now = datetime.now().strftime("%Y-%m-%d %I:%M %p")
-
-        con.execute(
-            """
-            UPDATE inventory
-            SET status = 'SOLD', sold_to = ?, sold_at = ?
-            WHERE id = ? AND status = 'AVAILABLE'
-            """,
-            (user_id, now, item["id"]),
-        )
-
-        if con.total_changes != 1:
-            con.rollback()
-            return None, "RESERVATION_FAILED"
-
-        con.execute(
-            "UPDATE orders SET status = 'DELIVERED' WHERE order_id = ?",
-            (order_id,),
-        )
-        con.commit()
-
-        return {
-            "email": item["email"],
-            "password": item["password"],
-            "delivered_at": now,
-        }, "DELIVERED"
-
-
-def purchase_from_balance(order_id, user_id, product_id, total):
-    """Atomically debit balance, reserve stock, and mark order delivered."""
-    with closing(db.connect()) as con:
-        con.execute("BEGIN IMMEDIATE")
-        order = con.execute(
-            "SELECT status FROM orders WHERE order_id=? AND user_id=?",
-            (order_id, user_id),
-        ).fetchone()
-        if not order:
-            con.rollback()
-            return None, "ORDER_NOT_FOUND"
-        if order["status"] == "DELIVERED":
-            con.rollback()
-            return None, "ALREADY_DELIVERED"
-        user = con.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()
-        if not user or float(user["balance"]) + 1e-9 < float(total):
-            con.rollback()
-            return None, "INSUFFICIENT_BALANCE"
-        item = con.execute(
-            "SELECT id,email,password FROM inventory WHERE product_id=? AND status='AVAILABLE' ORDER BY id ASC LIMIT 1",
-            (product_id,),
-        ).fetchone()
-        if not item:
-            con.rollback()
-            return None, "OUT_OF_STOCK"
-        now = datetime.now().strftime("%Y-%m-%d %I:%M %p")
-        cur = con.execute(
-            "UPDATE inventory SET status='SOLD', sold_to=?, sold_at=? WHERE id=? AND status='AVAILABLE'",
-            (user_id, now, item["id"]),
-        )
-        if cur.rowcount != 1:
-            con.rollback()
-            return None, "RESERVATION_FAILED"
-        cur = con.execute(
-            "UPDATE users SET balance=balance-? WHERE user_id=? AND balance>=?",
-            (float(total), user_id, float(total)),
-        )
-        if cur.rowcount != 1:
-            con.rollback()
-            return None, "INSUFFICIENT_BALANCE"
-        con.execute("UPDATE orders SET status='DELIVERED', payment_method='Balance' WHERE order_id=?", (order_id,))
-        con.commit()
-        return {
-            "email": item["email"],
-            "password": item["password"],
-            "delivered_at": now,
-            "new_balance": float(user["balance"]) - float(total),
-        }, "DELIVERED"
-
-
-async def send_delivery(context, order, product, deliveries):
-    if isinstance(deliveries, dict):
-        deliveries = [deliveries]
-    lines = [
-        "🎉 DELIVERY SUCCESSFUL!",
-        "━━━━━━━━━━━━━━━━",
-        f"🧾 Order ID: #{order['order_id']}",
-        f"📦 Item: {product['name']}",
-        f"🏷 Category: {product['category']}",
-        f"🔢 Quantity: {order['quantity']}",
-        f"💰 Total Price: ${order['total']:.2f}",
-        "",
-    ]
-    for i, item in enumerate(deliveries, 1):
-        lines += [f"{i}. 📧 Email / Username: {item['email']}", f"🔑 Password: {item['password']}", ""]
-    if deliveries and "new_balance" in deliveries[0]:
-        lines.append(f"💳 Remaining Balance: ${deliveries[0]['new_balance']:.2f}")
-    if deliveries:
-        lines.append(f"🕒 {deliveries[-1].get('delivered_at','')}")
-    await context.bot.send_message(chat_id=order["user_id"], text="\n".join(lines))
-
-
-async def process_purchase(q, context, u, pid, qty):
-    p = PRODUCTS.get(pid)
-    if not p or not p.get("active", 1) or p.get("coming_soon"):
-        await q.edit_message_text("❌ Product unavailable.", reply_markup=back_button())
-        return
-    if qty < 1:
-        await q.edit_message_text("❌ Quantity must be at least 1.", reply_markup=back_button())
-        return
-    stock = db.get_product_stock(pid)
-    if qty > stock:
-        await q.edit_message_text(
-            f"❌ NOT ENOUGH STOCK\\n\\nRequested: {qty}\\nAvailable: {stock}\\n\\nContact @{SUPPORT.lstrip('@')}.",
-            reply_markup=back_button(),
-        )
-        return
-    total = round(float(p["price"]) * qty, 2)
-    user = db.get_user(u.id)
-    if not user:
-        db.upsert_user(u.id, u.full_name, u.username, None)
-        user = db.get_user(u.id)
-    if float(user["balance"]) + 1e-9 >= total:
-        order_id = db.create_order(u.id, pid, qty, total, "Balance")
-        order = get_order(order_id)
-        deliveries, result = purchase_from_balance_qty(order_id, u.id, pid, qty, total)
-        if result == "DELIVERED":
-            await send_delivery(context, order, p, deliveries)
-            await q.edit_message_text(
-                f"✅ PURCHASE COMPLETED\\n\\nOrder: #{order_id}\\nQuantity: {qty}\\n"
-                f"Total: ${total:.2f}\\nRemaining Balance: ${deliveries[0]['new_balance']:.2f}",
-                reply_markup=back_button(),
-            )
-            return
-        update_order_status(order_id, "OUT_OF_STOCK" if result == "OUT_OF_STOCK" else "CANCELLED")
-    order_id = db.create_order(u.id, pid, qty, total, "Binance Pay")
-    await q.edit_message_text(
-        f"🧾 ORDER #{order_id}\\n\\n📦 Product: {p['name']}\\n🔢 Quantity: {qty}\\n"
-        f"💵 Total: ${total:.2f}\\n💳 Balance: ${float(user['balance']):.2f}\\n\\n"
-        "Please pay the full amount using Binance Pay.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🟡 Binance Pay", callback_data=f"paybin:{order_id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="home")],
-        ]),
-    )
-
-
-async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    u = update.effective_user
-    data = q.data
-
-    if data == "home":
-        await q.edit_message_text("🏠 MAIN MENU", reply_markup=main_menu())
-        return
-
-    if data == "profile":
-        user = db.get_user(u.id)
-        refs = db.get_ref_count(u.id)
-        username = f"@{user['username']}" if user["username"] else "@N/A"
-        bot = await context.bot.get_me()
-        ref_link = f"https://t.me/{bot.username}?start=ref_{u.id}"
-
-        text = (
-            "👤 ACCOUNT DASHBOARD\n"
-            "━━━━━━━━━━━━━━━━\n"
-            f"🏷 Name: {user['name']}\n"
-            f"🔰 Username: {username}\n"
-            f"🆔 User ID: {u.id}\n"
-            "━━━━━━━━━━━━━━━━\n"
-            f"💳 Balance: ${user['balance']:.2f}\n\n"
-            f"🎯 Ref Link: {ref_link}\n"
-            f"📊 Total Refs: {refs}\n"
-            f"🎁 Ref Income: ${user['ref_income']:.2f}"
-        )
-        await q.edit_message_text(text, reply_markup=back_button())
-        return
-
-    if data == "products":
-        cats = sorted({p["category"] for p in PRODUCTS.values()})
-        rows = [[InlineKeyboardButton(c, callback_data="cat:" + c)] for c in cats]
-        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="home")])
-        await q.edit_message_text(
-            "🛍️ BUY PRODUCTS",
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
-        return
-
-    if data.startswith("cat:"):
-        cat = data[4:]
-        groups = []
-        for pid, p in PRODUCTS.items():
-            if p["category"] == cat:
-                g = p.get("group_name") or "Other"
-                if g not in groups:
-                    groups.append(g)
-        if len(groups) <= 1:
-            rows = []
-            for pid, p in PRODUCTS.items():
-                if p["category"] == cat:
-                    label = "⏳ " + p["name"] if p.get("coming_soon") else f"{p['name']} — ${p['price']:.2f}"
-                    rows.append([InlineKeyboardButton(label, callback_data="product:" + pid)])
-            rows.append([InlineKeyboardButton("⬅️ Back", callback_data="products")])
-            await q.edit_message_text(f"🛍️ {cat}", reply_markup=InlineKeyboardMarkup(rows))
-            return
-        rows = [[InlineKeyboardButton(g, callback_data=f"group:{cat}|{g}")] for g in groups]
-        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="products")])
-        await q.edit_message_text(f"🛍️ {cat}\n\nSelect a group:", reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if data.startswith("group:"):
-        cat, group = data[6:].split("|", 1)
-        rows = []
-        for pid, p in PRODUCTS.items():
-            if p["category"] == cat and (p.get("group_name") or "Other") == group:
-                label = "⏳ " + p["name"] if p.get("coming_soon") else f"{p['name']} — ${p['price']:.2f}"
-                rows.append([InlineKeyboardButton(label, callback_data="product:" + pid)])
-        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="cat:" + cat)])
-        await q.edit_message_text(f"🛍️ {group}", reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if data.startswith("product:"):
-        pid = data[8:]
-        p = PRODUCTS.get(pid)
-        if not p:
-            await q.edit_message_text("Product not found.", reply_markup=back_button())
-            return
-        if p.get("coming_soon") or not p.get("active", 1):
-            await q.edit_message_text("⏳ COMING SOON\n\nThis product is not available yet.", reply_markup=back_button())
-            return
-        stock = db.get_product_stock(pid)
-        if stock <= 0:
-            await q.edit_message_text(f"❌ OUT OF STOCK\n\nContact @{SUPPORT.lstrip('@')} for help.", reply_markup=back_button())
-            return
-        text = (f"🛍️ {p['name']}\n\n💰 Price: ${p['price']:.2f} each\n"
-                f"📦 Available: {stock}\n\nSelect quantity:")
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("1", callback_data=f"qty:{pid}:1"),
-             InlineKeyboardButton("2", callback_data=f"qty:{pid}:2"),
-             InlineKeyboardButton("5", callback_data=f"qty:{pid}:5"),
-             InlineKeyboardButton("10", callback_data=f"qty:{pid}:10")],
-            [InlineKeyboardButton("✏️ Custom Quantity", callback_data=f"customqty:{pid}")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="cat:" + p["category"])],
-        ])
-        await q.edit_message_text(text, reply_markup=kb)
-        return
-
-    if data.startswith("customqty:"):
-        pid = data.split(":", 1)[1]
-        context.user_data["awaiting_qty"] = pid
-        await q.edit_message_text("✏️ Send the quantity as a whole number.\n\nExample: 7", reply_markup=back_button())
-        return
-
-    if data.startswith("qty:"):
-        _, pid, qty_raw = data.split(":", 2)
-        try:
-            qty = int(qty_raw)
-        except ValueError:
-            await q.edit_message_text("❌ Invalid quantity.", reply_markup=back_button())
-            return
-        await process_purchase(q, context, u, pid, qty)
-        return
-
-    if data.startswith("buy:"):
-        pid = data[4:]
-        await process_purchase(q, context, u, pid, 1)
-        return
-
-    if data.startswith("paybin:"):
-        order_id = data.split(":", 1)[1]
-        order = get_order(order_id)
-        if not order:
-            await q.edit_message_text("❌ Order not found.", reply_markup=back_button())
-            return
-
-        text = (
-            "🟡 BINANCE PAY\n"
-            "━━━━━━━━━━━━━━━━\n\n"
-            f"🧾 Order ID: #{order_id}\n"
-            f"💰 Amount: ${order['total']:.2f}\n\n"
-            "🆔 Binance Pay ID:\n"
-            f"{BINANCE_PAY_ID}\n\n"
-            "Please send the exact amount using Binance Pay.\n\n"
-            "After completing the payment, press:\n"
-            "✅ I Have Paid"
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ I Have Paid", callback_data=f"paid:{order_id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="home")],
-        ])
-        await q.edit_message_text(text, reply_markup=kb)
-        return
-
-    if data.startswith("paid:"):
-        order_id = data.split(":", 1)[1]
-        order = get_order(order_id)
-        if not order:
-            await q.edit_message_text("❌ Order not found.", reply_markup=back_button())
-            return
-
-        if order["status"] in ("WAITING_PAYMENT", "CONFIRMED", "DELIVERED"):
-            await q.edit_message_text(
-                f"⏳ Order #{order_id} is already being processed.",
-                reply_markup=back_button(),
-            )
-            return
-
-        update_order_status(order_id, "WAITING_PAYMENT")
-        product = PRODUCTS.get(order["product_id"], {"name": order["product_id"]})
-        admin_text = (
-            "🔔 NEW PAYMENT REPORT\n"
-            "━━━━━━━━━━━━━━━━\n\n"
-            f"🧾 Order ID: #{order_id}\n"
-            f"👤 User ID: {order['user_id']}\n"
-            f"📦 Product: {product['name']}\n"
-            f"💰 Amount: ${order['total']:.2f}\n"
-            "💳 Payment: Binance Pay\n"
-            "📌 Status: WAITING PAYMENT\n\n"
-            "Please verify the payment manually."
-        )
-        admin_kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ Approve", callback_data=f"approve:{order_id}"),
-                InlineKeyboardButton("❌ Reject", callback_data=f"reject:{order_id}"),
-            ]
-        ])
-
-        for admin_id in get_admin_ids():
-            try:
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=admin_text,
-                    reply_markup=admin_kb,
-                )
-            except Exception as e:
-                print(f"Admin notification error: {e}")
-
-        await q.edit_message_text(
-            "✅ PAYMENT SUBMITTED\n"
-            "━━━━━━━━━━━━━━━━\n\n"
-            f"🧾 Order ID: #{order_id}\n\n"
-            "Your payment report has been sent to our admin.\n\n"
-            "⏳ Please wait while your payment is verified.",
-            reply_markup=back_button(),
-        )
-        return
-
-    if data.startswith("approve:"):
-        if not is_admin(u.id):
-            await q.answer("⛔ Admin only.", show_alert=True)
-            return
-
-        order_id = data.split(":", 1)[1]
-        order = get_order(order_id)
-        if not order:
-            await q.edit_message_text("❌ Order not found.")
-            return
-
-        if order["status"] == "DELIVERED":
-            await q.edit_message_text(f"✅ Order #{order_id} was already delivered.")
-            return
-
-        if order["status"] not in ("WAITING_PAYMENT", "PENDING"):
-            await q.edit_message_text(
-                f"ℹ️ Order #{order_id} status is already {order['status']}."
-            )
-            return
-
-        product = PRODUCTS.get(order["product_id"], {"name": order["product_id"], "category": "Product"})
-        delivery, result = deliver_one_item(
-            order_id,
-            order["user_id"],
-            order["product_id"],
-        )
-
-        if result == "OUT_OF_STOCK":
-            update_order_status(order_id, "CONFIRMED")
-            try:
-                await context.bot.send_message(
-                    chat_id=order["user_id"],
-                    text=(
-                        "✅ PAYMENT CONFIRMED\n"
-                        "━━━━━━━━━━━━━━━━\n\n"
-                        f"🧾 Order ID: #{order_id}\n"
-                        f"💰 Amount: ${order['total']:.2f}\n\n"
-                        "Your payment has been verified successfully.\n\n"
-                        "⚠️ Your product is temporarily out of stock.\n"
-                        "Delivery will be completed after stock is available."
-                    ),
-                )
-            except Exception as e:
-                print(f"User notification error: {e}")
-
-            await q.edit_message_text(
-                f"⚠️ Order #{order_id} approved, but product is OUT OF STOCK."
-            )
-            return
-
-        if result == "ALREADY_DELIVERED":
-            await q.edit_message_text(f"✅ Order #{order_id} was already delivered.")
-            return
-
-        if result != "DELIVERED":
-            await q.edit_message_text(
-                f"❌ Delivery failed for order #{order_id}. Please check Railway logs."
-            )
-            return
-
-        try:
-            await send_delivery(context, order, product, delivery)
-        except Exception as e:
-            print(f"Delivery notification error: {e}")
-            # The inventory item is already marked SOLD and the order DELIVERED.
-            # Keep that state to prevent duplicate delivery.
-
-        await q.edit_message_text(
-            f"✅ Order #{order_id} approved and DELIVERED."
-        )
-        return
-
-    if data.startswith("reject:"):
-        if not is_admin(u.id):
-            await q.answer("⛔ Admin only.", show_alert=True)
-            return
-
-        order_id = data.split(":", 1)[1]
-        order = get_order(order_id)
-        if not order:
-            await q.edit_message_text("❌ Order not found.")
-            return
-
-        if order["status"] == "DELIVERED":
-            await q.edit_message_text("❌ This order has already been delivered.")
-            return
-
-        update_order_status(order_id, "REJECTED")
-
-        try:
-            await context.bot.send_message(
-                chat_id=order["user_id"],
-                text=(
-                    "❌ PAYMENT REJECTED\n"
-                    "━━━━━━━━━━━━━━━━\n\n"
-                    f"🧾 Order ID: #{order_id}\n\n"
-                    "We could not verify your payment.\n\n"
-                    "Please contact support if you believe this is an error."
-                ),
-            )
-        except Exception as e:
-            print(f"User notification error: {e}")
-
-        await q.edit_message_text(f"❌ Order #{order_id} rejected.")
-        return
-
-    if data == "orders":
-        rows = db.get_orders(u.id)
-        if not rows:
-            text = "📦 MY ORDERS\n\nNo orders yet."
-        else:
-            text = "📦 MY ORDERS\n━━━━━━━━━━━━━━━━\n"
-            for r in rows:
-                p = PRODUCTS.get(r["product_id"], {"name": r["product_id"]})
-                text += (
-                    f"#{r['order_id']} — {p['name']} — "
-                    f"${r['total']:.2f} — {r['status']}\n"
-                )
-
-        await q.edit_message_text(text, reply_markup=back_button())
-        return
-
-    if data == "payments":
-        user = db.get_user(u.id)
-        balance = user["balance"] if user else 0.0
-        await q.edit_message_text(
-            "💰 PAYMENT METHODS\n"
-            "━━━━━━━━━━━━━━━━\n\n"
-            f"💳 Your Balance: ${balance:.2f}\n\n"
-            "🟡 Binance Pay\n"
-            "Add balance using Binance Pay.\n"
-            "Payment verification is handled manually by admin.\n\n"
-            "🔵 USDT TRC20\n"
-            "Coming later.",
-            reply_markup=balance_menu(),
-        )
-        return
-
-    if data == "show_balance":
-        user = db.get_user(u.id)
-        balance = user["balance"] if user else 0.0
-        await q.edit_message_text(
-            "💳 MY BALANCE\n"
-            "━━━━━━━━━━━━━━━━\n\n"
-            f"Available Balance: ${balance:.2f}\n\n"
-            "Use your balance for future purchases without making a new payment.",
-            reply_markup=balance_menu(),
-        )
-        return
-
-    if data == "add_balance":
-        context.user_data["awaiting_balance_amount"] = True
-        await q.edit_message_text(
-            "➕ ADD BALANCE\n"
-            "━━━━━━━━━━━━━━━━\n\n"
-            "Enter the amount in USD you want to add.\n\n"
-            "Examples: 10, 25.50, 100\n\n"
-            "❌ Send /cancel to cancel.",
-            reply_markup=back_button(),
-        )
-        return
-
-    if data.startswith("balpay:"):
-        request_id = data.split(":", 1)[1]
-        request = db.get_balance_request(request_id)
-        if not request or request["user_id"] != u.id:
-            await q.edit_message_text("❌ Balance request not found.", reply_markup=back_button())
-            return
-        await q.edit_message_text(
-            "🟡 ADD BALANCE — BINANCE PAY\n"
-            "━━━━━━━━━━━━━━━━\n\n"
-            f"🧾 Request ID: #{request_id}\n"
-            f"💰 Amount: ${request['amount']:.2f}\n\n"
-            "🆔 Binance Pay ID:\n"
-            f"{BINANCE_PAY_ID}\n\n"
-            "Please send the exact amount using Binance Pay.\n\n"
-            "After completing the payment, press:\n"
-            "✅ I Have Paid",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ I Have Paid", callback_data=f"balpaid:{request_id}")],
-                [InlineKeyboardButton("❌ Cancel", callback_data="home")],
-            ]),
-        )
-        return
-
-    if data.startswith("balpaid:"):
-        request_id = data.split(":", 1)[1]
-        request = db.get_balance_request(request_id)
-        if not request or request["user_id"] != u.id:
-            await q.edit_message_text("❌ Balance request not found.", reply_markup=back_button())
-            return
-        if request["status"] != "PENDING":
-            await q.edit_message_text(
-                f"⏳ Balance request #{request_id} is already {request['status']}.",
-                reply_markup=back_button(),
-            )
-            return
-        db.update_balance_request_status(request_id, "WAITING_PAYMENT")
-        admin_text = (
-            "💰 NEW BALANCE PAYMENT\n"
-            "━━━━━━━━━━━━━━━━\n\n"
-            f"🧾 Request ID: #{request_id}\n"
-            f"👤 User ID: {request['user_id']}\n"
-            f"💵 Add Balance: ${request['amount']:.2f}\n"
-            "💳 Payment: Binance Pay\n"
-            "📌 Status: WAITING PAYMENT\n\n"
-            "Please verify the payment manually."
-        )
-        admin_kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Approve", callback_data=f"balapprove:{request_id}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"balreject:{request_id}"),
-        ]])
-        for admin_id in get_admin_ids():
-            try:
-                await context.bot.send_message(chat_id=admin_id, text=admin_text, reply_markup=admin_kb)
-            except Exception as e:
-                print(f"Admin balance notification error: {e}")
-        await q.edit_message_text(
-            "✅ BALANCE PAYMENT SUBMITTED\n"
-            "━━━━━━━━━━━━━━━━\n\n"
-            f"🧾 Request ID: #{request_id}\n"
-            f"💰 Amount: ${request['amount']:.2f}\n\n"
-            "⏳ Please wait while admin verifies your payment.",
-            reply_markup=back_button(),
-        )
-        return
-
-    if data.startswith("balapprove:"):
-        if not is_admin(u.id):
-            await q.answer("⛔ Admin only.", show_alert=True)
-            return
-        request_id = data.split(":", 1)[1]
-        request = db.get_balance_request(request_id)
-        if not request:
-            await q.edit_message_text("❌ Balance request not found.")
-            return
-        if request["status"] == "APPROVED":
-            await q.edit_message_text(f"✅ Balance request #{request_id} was already approved.")
-            return
-        if request["status"] not in ("WAITING_PAYMENT", "PENDING"):
-            await q.edit_message_text(f"ℹ️ Request #{request_id} status is {request['status']}.")
-            return
-        new_balance = db.approve_balance_request(request_id)
-        if new_balance is None:
-            await q.edit_message_text("❌ Could not approve this balance request.")
-            return
-        try:
-            await context.bot.send_message(
-                chat_id=request["user_id"],
-                text=(
-                    "✅ BALANCE ADDED\n"
-                    "━━━━━━━━━━━━━━━━\n\n"
-                    f"🧾 Request ID: #{request_id}\n"
-                    f"💰 Added: ${request['amount']:.2f}\n"
-                    f"💳 New Balance: ${new_balance:.2f}\n\n"
-                    "Your balance is now ready to use for future purchases."
-                ),
-            )
-        except Exception as e:
-            print(f"Balance user notification error: {e}")
-        await q.edit_message_text(
-            f"✅ Balance request #{request_id} approved.\n"
-            f"💰 Added: ${request['amount']:.2f}\n"
-            f"💳 New Balance: ${new_balance:.2f}"
-        )
-        return
-
-    if data.startswith("balreject:"):
-        if not is_admin(u.id):
-            await q.answer("⛔ Admin only.", show_alert=True)
-            return
-        request_id = data.split(":", 1)[1]
-        request = db.get_balance_request(request_id)
-        if not request:
-            await q.edit_message_text("❌ Balance request not found.")
-            return
-        if request["status"] == "APPROVED":
-            await q.edit_message_text("❌ This balance has already been added.")
-            return
-        db.update_balance_request_status(request_id, "REJECTED")
-        try:
-            await context.bot.send_message(
-                chat_id=request["user_id"],
-                text=(
-                    "❌ BALANCE PAYMENT REJECTED\n"
-                    "━━━━━━━━━━━━━━━━\n\n"
-                    f"🧾 Request ID: #{request_id}\n"
-                    f"💰 Amount: ${request['amount']:.2f}\n\n"
-                    "We could not verify your payment.\n"
-                    "Please contact support if you believe this is an error."
-                ),
-            )
-        except Exception as e:
-            print(f"Balance reject notification error: {e}")
-        await q.edit_message_text(f"❌ Balance request #{request_id} rejected.")
-        return
-
-    if data == "refer":
-        bot = await context.bot.get_me()
-        link = f"https://t.me/{bot.username}?start=ref_{u.id}"
-        refs = db.get_ref_count(u.id)
-        user = db.get_user(u.id)
-
-        await q.edit_message_text(
-            "👥 REFER & EARN\n"
-            "━━━━━━━━━━━━━━━━\n"
-            f"🎯 Your link:\n{link}\n\n"
-            f"📊 Total Refs: {refs}\n"
-            f"🎁 Ref Income: ${user['ref_income']:.2f}",
-            reply_markup=back_button(),
-        )
-        return
-
-    if data == "support":
-        await q.edit_message_text(
-            "🎧 SUPPORT\n"
-            "━━━━━━━━━━━━━━━━\n"
-            f"Contact: @{SUPPORT.lstrip('@')}",
-            reply_markup=back_button(),
-        )
-        return
-
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("awaiting_qty"):
-        pid = context.user_data.pop("awaiting_qty")
-        try:
-            qty = int(update.message.text.strip())
-        except ValueError:
-            await update.message.reply_text("❌ Invalid quantity. Send a whole number, e.g. 5.")
-            return
-        qmsg = update.message
-        class QWrap:
-            from_user = qmsg.from_user
-            async def edit_message_text(self, *args, **kwargs):
-                return await qmsg.reply_text(*args, **kwargs)
-        await process_purchase(QWrap(), context, update.effective_user, pid, qty)
-        return
-    if not context.user_data.get("awaiting_balance_amount"):
-        return
-    raw = update.message.text.strip().replace(",", "")
-    if raw.lower() == "/cancel":
-        context.user_data.pop("awaiting_balance_amount", None)
-        await update.message.reply_text("❌ Add Balance cancelled.", reply_markup=main_menu())
-        return
-    try:
-        amount = float(raw)
-    except ValueError:
-        await update.message.reply_text("❌ Invalid amount. Enter a valid USD amount, e.g. 10 or 25.50")
-        return
-    if amount <= 0:
-        await update.message.reply_text("❌ Amount must be greater than $0.")
-        return
-    if amount > 10000:
-        await update.message.reply_text("❌ Maximum balance top-up is $10,000.")
-        return
-    amount = round(amount, 2)
-    u = update.effective_user
-    db.upsert_user(u.id, u.full_name, u.username, None)
-    request_id = db.create_balance_request(u.id, amount)
-    context.user_data.pop("awaiting_balance_amount", None)
-    await update.message.reply_text(
-        "💰 ADD BALANCE\n━━━━━━━━━━━━━━━━\n\n"
-        f"💵 Amount: ${amount:.2f}\n\nChoose Binance Pay to continue.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🟡 Pay with Binance Pay", callback_data=f"balpay:{request_id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="home")],
-        ]),
-    )
-
-
-async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ids = get_admin_ids()
-    await update.message.reply_text(
-        "🆔 YOUR TELEGRAM ID\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        f"<code>{uid}</code>\n\n"
-        f"Admin status: {'✅ YES' if uid in ids else '❌ NO'}\n"
-        f"Loaded ADMIN_IDS: <code>{', '.join(map(str, sorted(ids))) or 'EMPTY'}</code>",
-        parse_mode="HTML",
-    )
-
-
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ids = get_admin_ids()
-
-    if uid not in ids:
-        await update.message.reply_text(
-            "⛔ ADMIN ACCESS DENIED\n"
-            "━━━━━━━━━━━━━━━━\n\n"
-            f"Your Telegram ID:\n<code>{uid}</code>\n\n"
-            f"Loaded ADMIN_IDS:\n<code>{', '.join(map(str, sorted(ids))) or 'EMPTY'}</code>\n\n"
-            "If this is your ID, put it in Railway → Variables → ADMIN_IDS, "
-            "then redeploy/restart the service.",
-            parse_mode="HTML",
-        )
-        return
-
-    await update.message.reply_text(
-        "🛠️ ADMIN PANEL\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "Choose an admin action:",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📊 Dashboard", callback_data="admin_dashboard")],
-            [InlineKeyboardButton("📦 Stock", callback_data="admin_stock")],
-            [InlineKeyboardButton("💰 Payments", callback_data="admin_payments")],
-            [InlineKeyboardButton("💳 Balance Requests", callback_data="admin_balances")],
-            [InlineKeyboardButton("🧾 Orders", callback_data="admin_orders")],
-            [InlineKeyboardButton("👥 Users", callback_data="admin_users")],
-            [InlineKeyboardButton("🎁 Referrals", callback_data="admin_refs")],
-            [InlineKeyboardButton("⬅️ Main Menu", callback_data="home")],
-        ]),
-    )
-
-
-async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not is_admin(q.from_user.id):
-        await q.answer("⛔ Admin only.", show_alert=True)
-        return
-    await q.answer()
-    data = q.data
-
-    if data == "admin_dashboard":
-        try:
-            rows = db.get_products_stock()
-            users = db.get_all_users_count() if hasattr(db, "get_all_users_count") else None
-            text = "📊 ADMIN DASHBOARD\n━━━━━━━━━━━━━━━━\n\n"
-            if users is not None:
-                text += f"👥 Users: {users}\n"
-            text += f"📦 Product types: {len(rows)}\n"
-            text += "\nUse /stock for exact available stock."
-        except Exception as e:
-            text = f"📊 ADMIN DASHBOARD\n\nCould not load dashboard: {e}"
-    elif data == "admin_stock":
-        rows = db.get_products_stock()
-        if not rows:
-            text = "📦 STOCK\n━━━━━━━━━━━━━━━━\n\nStock is empty."
-        else:
-            text = "📦 STOCK\n━━━━━━━━━━━━━━━━\n\n"
-            for r in rows:
-                p = PRODUCTS.get(r["product_id"], {"name": r["product_id"]})
-                text += f"• {p['name']}: {r['c']}\n"
-    elif data == "admin_payments":
-        text = "💰 PAYMENTS\n━━━━━━━━━━━━━━━━\n\nPending payment reports appear here when customers press I Have Paid."
-    elif data == "admin_balances":
-        text = "💳 BALANCE REQUESTS\n━━━━━━━━━━━━━━━━\n\nBalance payment reports appear here when customers press I Have Paid."
-    elif data == "admin_orders":
-        text = "🧾 ORDERS\n━━━━━━━━━━━━━━━━\n\nUse /orders to open the admin order view."
-    elif data == "admin_users":
-        text = "👥 USERS\n━━━━━━━━━━━━━━━━\n\nUse /myid to verify your own Telegram ID."
-    elif data == "admin_refs":
-        rate = float(db.get_setting("REFERRAL_RATE", "0.05"))
-        limit = int(db.get_setting("REFERRAL_DEPOSIT_LIMIT", "10"))
-        text = (
-            "🎁 REFERRALS\n━━━━━━━━━━━━━━━━\n\n"
-            f"Commission: {rate * 100:.2f}%\n"
-            f"Deposit limit: first {limit}\n\n"
-            "Change: /refrate 7.5 or /reflimit 20"
-        )
+async def start(update,context):
+    u=update.effective_user
+    ref=None
+    if context.args and context.args[0].startswith("ref_"):
+        try: ref=int(context.args[0][4:])
+        except: ref=None
+        if ref==u.id: ref=None
+    db.upsert_user(u.id,u.full_name,u.username,ref)
+    user=db.get_user(u.id)
+    if user["blocked"] or user["disabled"]:
+        return await update.message.reply_text("⛔ Your account is currently unavailable. Contact Support.")
+    await update.message.reply_text("🏠 <b>MAIN MENU</b>\n━━━━━━━━━━━━━━━━\nWelcome to the store!\n\nChoose an option below.",parse_mode="HTML",reply_markup=main_kb())
+
+async def myid(update,context):
+    await update.message.reply_text(f"🆔 <b>Your Telegram ID</b>\n<code>{update.effective_user.id}</code>\n\nAdmin: {'✅ YES' if is_admin(update.effective_user.id) else '❌ NO'}",parse_mode="HTML")
+
+async def admin_cmd(update,context):
+    if not is_admin(update.effective_user.id):
+        return await update.message.reply_text(f"⛔ Admin access denied.\n\nYour ID: <code>{update.effective_user.id}</code>\nCurrent ADMIN_IDS: <code>{', '.join(map(str,sorted(admins()))) or 'EMPTY'}</code>",parse_mode="HTML")
+    await update.message.reply_text("🛠️ <b>ADMIN PANEL V3</b>\n\nChoose an admin action:",parse_mode="HTML",reply_markup=admin_kb())
+
+async def home(update,context):
+    q=update.callback_query; await q.answer()
+    await q.edit_message_text("🏠 <b>MAIN MENU</b>\n━━━━━━━━━━━━━━━━\nWelcome to the store!\n\nChoose an option below.",parse_mode="HTML",reply_markup=main_kb())
+
+async def customer_cb(update,context):
+    q=update.callback_query; await q.answer(); d=q.data
+    if d=="profile":
+        u=db.get_user(q.from_user.id); link=f"https://t.me/{context.bot.username}?start=ref_{u['user_id']}"
+        return await q.edit_message_text(f"👤 <b>ACCOUNT DASHBOARD</b>\n━━━━━━━━━━━━━━━━\nName: {u['name']}\nUsername: @{u['username'] or 'N/A'}\nUser ID: <code>{u['user_id']}</code>\nBalance: <b>{money(u['balance'])}</b>\nRef Link: <code>{link}</code>\nTotal Refs: {db.ref_count(u['user_id'])}\nRef Income: {money(u['ref_income'])}",parse_mode="HTML",reply_markup=back())
+    if d=="products":
+        cs=db.categories(); kb=[[InlineKeyboardButton(c,callback_data=f"cat:{c}")] for c in cs]+[[InlineKeyboardButton("⬅️ Main Menu",callback_data="home")]]
+        return await q.edit_message_text("🛍️ <b>BUY PRODUCTS</b>\n\nSelect a category:",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+    if d=="orders":
+        return await show_orders(q)
+    if d=="balance":
+        u=db.get_user(q.from_user.id)
+        methods=db.payment_methods(True)
+        kb=[[InlineKeyboardButton(f"{m['emoji']} {m['name']}",callback_data=f"balmethod:{m['code']}")] for m in methods]
+        kb += [[InlineKeyboardButton("💳 My Balance",callback_data="showbal")],[InlineKeyboardButton("⬅️ Main Menu",callback_data="home")]]
+        return await q.edit_message_text(f"💳 <b>ADD BALANCE</b>\nCurrent Balance: <b>{money(u['balance'])}</b>\n\nChoose payment method:",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+    if d=="refer":
+        u=db.get_user(q.from_user.id); rate=float(db.setting("REFERRAL_RATE","0.05"))*100; lim=int(db.setting("REFERRAL_DEPOSIT_LIMIT","10"))
+        link=f"https://t.me/{context.bot.username}?start=ref_{u['user_id']}"
+        return await q.edit_message_text(f"👥 <b>REFER & EARN</b>\n━━━━━━━━━━━━━━━━\nCommission: <b>{rate:.2f}%</b>\nFirst approved deposits: <b>{lim}</b>\n\nYour link:\n<code>{link}</code>\n\nTotal Refs: {db.ref_count(u['user_id'])}\nRef Income: {money(u['ref_income'])}",parse_mode="HTML",reply_markup=back())
+    if d=="support":
+        return await q.edit_message_text(f"🎧 <b>SUPPORT</b>\n\n{SUPPORT}",parse_mode="HTML",reply_markup=back())
+
+async def show_orders(q):
+    rows=db.recent_orders(q.from_user.id,24)
+    if not rows:return await q.edit_message_text("📦 <b>MY ORDERS — LAST 24 HOURS</b>\n\nNo orders.",parse_mode="HTML",reply_markup=back())
+    lines=["📦 <b>MY ORDERS — LAST 24 HOURS</b>","━━━━━━━━━━━━━━━━"]
+    for o in rows:
+        lines += [f"\n<b>#{o['order_id']}</b> — {o['product_name']}",f"Quantity: {o['quantity']} | Total: {money(o['total'])}",f"Status: {o['status']}"]
+        if o["status"]=="DELIVERED":
+            for i,it in enumerate(db.order_items(o["order_id"]),1):
+                lines += [f"{i}.📧 Email / Username: {it['email']}",f"🔑 Password: {it['password']}"]
+    await q.edit_message_text("\n".join(lines),parse_mode="HTML",reply_markup=back())
+
+async def category_cb(update,context):
+    q=update.callback_query; await q.answer(); cat=q.data[4:]; gs=db.groups(cat)
+    if gs:
+        kb=[[InlineKeyboardButton(g,callback_data=f"grp:{cat}|{g}")] for g in gs]
     else:
-        text = "🛠️ ADMIN PANEL"
+        kb=[[InlineKeyboardButton(p["name"],callback_data=f"prd:{p['product_id']}")] for p in db.products(cat)]
+    kb.append([InlineKeyboardButton("⬅️ Back",callback_data="products")])
+    await q.edit_message_text(f"🛍️ <b>{cat}</b>\n\nSelect:",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
 
-    await q.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Admin Panel", callback_data="admin_back")],
-            [InlineKeyboardButton("🏠 Main Menu", callback_data="home")],
-        ]),
-    )
+async def group_cb(update,context):
+    q=update.callback_query; await q.answer(); cat,grp=q.data[4:].split("|",1)
+    ps=db.products(cat,grp); kb=[]
+    for p in ps:
+        st=db.stock_count(p["product_id"])
+        label="Coming Soon" if p["coming_soon"] else f"{money(p['price'])} | Stock {st}"
+        kb.append([InlineKeyboardButton(f"{p['name']} — {label}",callback_data=f"prd:{p['product_id']}")])
+    kb.append([InlineKeyboardButton("⬅️ Back",callback_data=f"cat:{cat}")])
+    await q.edit_message_text(f"🛍️ <b>{grp}</b>",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
 
+async def product_cb(update,context):
+    q=update.callback_query; await q.answer(); pid=q.data[4:]; p=db.get_product(pid)
+    if not p or not p["active"] or p["coming_soon"]: return await q.edit_message_text("⏳ This product is currently unavailable.",reply_markup=back())
+    st=db.stock_count(pid)
+    if st<1:return await q.edit_message_text(f"❌ <b>OUT OF STOCK</b>\n\nContact {SUPPORT}.",parse_mode="HTML",reply_markup=back())
+    kb=[[InlineKeyboardButton(str(x),callback_data=f"qty:{pid}:{x}") for x in (1,2,5,10)],[InlineKeyboardButton("✏️ Custom Quantity",callback_data=f"custom:{pid}")],[InlineKeyboardButton("⬅️ Back",callback_data=f"grp:{p['category']}|{p['group_name']}")]]
+    await q.edit_message_text(f"🛍️ <b>{p['name']}</b>\n💵 {money(p['price'])} each\n📦 Available: {st}\n\nSelect quantity:",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
 
-async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not is_admin(q.from_user.id):
-        await q.answer("⛔ Admin only.", show_alert=True)
+async def quantity_cb(update,context):
+    q=update.callback_query; await q.answer(); _,pid,qty=q.data.split(":"); await begin_purchase(q,context,pid,int(qty))
+
+async def custom_cb(update,context):
+    q=update.callback_query; await q.answer(); context.user_data["custom_pid"]=q.data[7:]
+    await q.edit_message_text("✏️ Send the custom quantity as a number.",reply_markup=back())
+
+async def begin_purchase(q,context,pid,qty):
+    p=db.get_product(pid); st=db.stock_count(pid)
+    if qty<1:return await q.edit_message_text("❌ Invalid quantity.")
+    if qty>st:return await q.edit_message_text(f"❌ Not enough stock.\nRequested: {qty}\nAvailable: {st}\nContact {SUPPORT}.",reply_markup=back())
+    total=round(float(p["price"])*qty,2)
+    u=db.get_user(q.from_user.id)
+    if float(u["balance"])>=total:
+        oid=db.create_order(q.from_user.id,pid,qty,total,"Balance")
+        items,newbal=db.purchase_balance(q.from_user.id,pid,qty,total)
+        if items:
+            return await q.edit_message_text(delivery(p,items,total,"Balance"),parse_mode="HTML",reply_markup=back())
+    oid=db.create_order(q.from_user.id,pid,qty,total,None)
+    methods=db.payment_methods(True)
+    kb=[[InlineKeyboardButton(f"{m['emoji']} {m['name']}",callback_data=f"pay:{oid}:{m['code']}")] for m in methods]
+    kb.append([InlineKeyboardButton("❌ Cancel",callback_data="home")])
+    await q.edit_message_text(f"💳 <b>PAYMENT REQUIRED</b>\nProduct: {p['name']}\nQuantity: {qty}\nTotal: <b>{money(total)}</b>\n\nChoose payment method:",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+
+def delivery(p,items,total,method):
+    s=[f"🎉 <b>DELIVERY SUCCESSFUL!</b>","━━━━━━━━━━━━━━━━━━",f"Product: {p['name']}",f"Quantity: {len(items)}",f"Total: {money(total)}",f"Payment: {method}",""]
+    for i,it in enumerate(items,1):s += [f"{i}.📧 Email / Username: {it['email']}",f"🔑 Password: {it['password']}"]
+    return "\n".join(s)
+
+async def pay_method_cb(update,context):
+    q=update.callback_query; await q.answer(); _,oid,code=q.data.split(":",2); o=db.get_order(int(oid)); m=db.get_payment(code)
+    if not o or o["user_id"]!=q.from_user.id or not m or not m["enabled"]:return await q.answer("Invalid payment method.",show_alert=True)
+    db.update_product if False else None
+    db.mark_paid_waiting(int(oid))
+    text=f"💳 <b>{m['emoji']} {m['name']}</b>\n━━━━━━━━━━━━━━━━\nOrder: <code>#{oid}</code>\nAmount: <b>{money(o['total'])}</b>\nCurrency: {m['currency']}\n\n{m['instructions']}"
+    if code=="binance" and BINANCE_PAY_ID:text+=f"\n\nBinance Pay ID:\n<code>{BINANCE_PAY_ID}</code>"
+    kb=[[InlineKeyboardButton("✅ I Have Paid",callback_data=f"paid:{oid}")],[InlineKeyboardButton("❌ Cancel",callback_data="home")]]
+    await q.edit_message_text(text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+
+async def paid_cb(update,context):
+    q=update.callback_query; await q.answer("Payment reported.")
+    oid=int(q.data.split(":")[1]); o=db.get_order(oid)
+    if not o or o["user_id"]!=q.from_user.id:return
+    for aid in admins():
+        try:
+            await context.bot.send_message(aid,f"🔔 <b>PAYMENT REPORT</b>\nOrder: <code>#{oid}</code>\nUser: <code>{q.from_user.id}</code>\nProduct: {o['product_name']}\nQty: {o['quantity']}\nAmount: <b>{money(o['total'])}</b>",parse_mode="HTML",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve",callback_data=f"approve:{oid}"),InlineKeyboardButton("❌ Reject",callback_data=f"reject:{oid}")]]))
+        except Exception as e:log.warning("admin notify: %s",e)
+    await q.edit_message_text("⏳ Payment reported. Admin will verify it.",reply_markup=back())
+
+async def balance_method_cb(update,context):
+    q=update.callback_query; await q.answer(); code=q.data.split(":")[1]; m=db.get_payment(code)
+    if not m or not m["enabled"]:return await q.answer("Unavailable.",show_alert=True)
+    context.user_data["bal_method"]=code
+    await q.edit_message_text(f"{m['emoji']} <b>{m['name']}</b>\n\n{m['instructions']}\n\nEnter the amount in <b>{m['currency']}</b>.",parse_mode="HTML",reply_markup=back())
+
+async def showbal(update,context):
+    q=update.callback_query; await q.answer(); u=db.get_user(q.from_user.id)
+    await q.edit_message_text(f"💳 Current Balance: <b>{money(u['balance'])}</b>",parse_mode="HTML",reply_markup=back())
+
+async def approve_cb(update,context):
+    q=update.callback_query
+    if not is_admin(q.from_user.id):return await q.answer("⛔ Admin only.",show_alert=True)
+    await q.answer(); oid=int(q.data.split(":")[1]); items,status=db.reserve_and_deliver_order(oid)
+    if not items:return await q.answer(f"Cannot approve: {status}",show_alert=True)
+    o=db.get_order(oid); p=db.get_product(o["product_id"])
+    await context.bot.send_message(o["user_id"],delivery(p,items,o["total"],o["payment_method"] or "Payment"),parse_mode="HTML")
+    await q.edit_message_text(f"✅ Order #{oid} approved and delivered.",reply_markup=admin_kb())
+
+async def reject_cb(update,context):
+    q=update.callback_query
+    if not is_admin(q.from_user.id):return await q.answer("⛔ Admin only.",show_alert=True)
+    await q.answer(); oid=int(q.data.split(":")[1]); db.reject_order(oid); o=db.get_order(oid)
+    try:await context.bot.send_message(o["user_id"],f"❌ Order #{oid} payment was rejected.")
+    except:pass
+    await q.edit_message_text(f"❌ Order #{oid} rejected.",reply_markup=admin_kb())
+
+async def balpaid_cb(update,context):
+    q=update.callback_query; await q.answer("Payment reported.")
+    rid=int(q.data.split(":")[1]); r=db.get_balance_request(rid)
+    if not r or r["user_id"]!=q.from_user.id:return
+    db.mark_balance_waiting(rid)
+    for aid in admins():
+        try:await context.bot.send_message(aid,f"🔔 <b>BALANCE PAYMENT</b>\nRequest: <code>#{rid}</code>\nUser: <code>{q.from_user.id}</code>\nAmount: <b>{r['amount']} {r['currency']}</b>\nUSD Credit: <b>{money(r['usd_amount'] or r['amount'])}</b>",parse_mode="HTML",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve",callback_data=f"bapprove:{rid}"),InlineKeyboardButton("❌ Reject",callback_data=f"breject:{rid}")]]))
+        except:pass
+    await q.edit_message_text("⏳ Balance payment reported. Admin will verify it.",reply_markup=back())
+
+async def bapprove_cb(update,context):
+    q=update.callback_query
+    if not is_admin(q.from_user.id):return await q.answer("⛔ Admin only.",show_alert=True)
+    await q.answer();rid=int(q.data.split(":")[1]);credit=db.approve_balance(rid)
+    if credit is None:return await q.answer("Already processed.",show_alert=True)
+    r=db.get_balance_request(rid);u=db.get_user(r["user_id"])
+    await context.bot.send_message(r["user_id"],f"✅ Balance request #{rid} approved.\n💵 Added: <b>{money(credit)}</b>\n💳 New Balance: <b>{money(u['balance'])}</b>",parse_mode="HTML")
+    await q.edit_message_text(f"✅ Balance request #{rid} approved.",reply_markup=admin_kb())
+
+async def breject_cb(update,context):
+    q=update.callback_query
+    if not is_admin(q.from_user.id):return await q.answer("⛔ Admin only.",show_alert=True)
+    await q.answer();rid=int(q.data.split(":")[1]);db.reject_balance(rid);r=db.get_balance_request(rid)
+    try:await context.bot.send_message(r["user_id"],f"❌ Balance request #{rid} was rejected.")
+    except:pass
+    await q.edit_message_text(f"❌ Balance request #{rid} rejected.",reply_markup=admin_kb())
+
+async def admin_cb(update,context):
+    q=update.callback_query
+    if not is_admin(q.from_user.id):return await q.answer("⛔ Admin only.",show_alert=True)
+    await q.answer(); key=q.data[3:]
+    if key=="dashboard":
+        s=db.dashboard();text=f"📊 <b>DASHBOARD</b>\n━━━━━━━━━━━━━━━━\n👥 Users: {s['users']}\n🧾 Delivered Orders: {s['orders']}\n💰 Total Sales: {money(s['sales'])}\n⏳ Pending Payments: {s['pending']}\n📦 Available Stock: {s['stock']}\n🟠 Low Stock: {s['low']}\n🔴 Out of Stock: {s['out']}"
+    elif key=="sales24":
+        rows,prods,total=db.sales_24h(); lines=[f"💰 <b>SALES — LAST 24 HOURS</b>\n━━━━━━━━━━━━━━━━\nTotal Sales: <b>{money(total)}</b>"]
+        for r in rows:lines.append(f"\n{r['payment_method'] or 'Unknown'}: {money(r['sales'])} | Orders {r['orders']} | Qty {r['qty']}")
+        if prods:
+            lines.append("\n📦 <b>Products</b>")
+            for p in prods:lines.append(f"• {p['name']}: {p['qty']} sold | {money(p['sales'])}")
+        text="\n".join(lines)
+    elif key=="products":
+        ps=db.stock_summary();lines=["🛍️ <b>PRODUCTS</b>","━━━━━━━━━━━━━━━━"]
+        for p in ps[:50]:lines.append(f"#{p['id']} • {p['name']} • {money(p['price'])} • {'ON' if p['active'] else 'OFF'}")
+        lines += ["","Commands:","<code>/addcategory Name</code>","<code>/addproduct id|category|group|name|price|active|coming_soon</code>","<code>/price product_id|new_price</code>","<code>/toggle product_id</code>","<code>/rename product_id|new name</code>"]
+        text="\n".join(lines)
+    elif key=="inventory":
+        rows=db.stock_summary();text="📦 <b>INVENTORY</b>\n━━━━━━━━━━━━━━━━\n"+"\n".join(f"#{r['id']} {r['name']} — Available {r['available'] or 0} | Sold {r['sold'] or 0} | Invalid {r['invalid'] or 0}" for r in rows[:50])+"\n\n<code>/addstock product_id|email|password</code>"
+    elif key=="payments":
+        rows=db.pending_orders();text="💰 <b>PENDING PAYMENTS</b>\n━━━━━━━━━━━━━━━━\n" + ("\n".join(f"#{r['order_id']} {r['product_name']} {money(r['total'])} • {r['status']}" for r in rows) or "None.")
+    elif key=="paymethods":
+        ms=db.payment_methods(); lines=["💳 <b>PAYMENT METHODS</b>","━━━━━━━━━━━━━━━━"]
+        for m in ms:lines.append(f"{m['emoji']} <b>{m['name']}</b> | {m['code']} | {m['currency']} | {'ON' if m['enabled'] else 'OFF'}")
+        lines += ["","➕ Add any future method:","<code>/addpayment code|name|emoji|currency|instructions</code>","<code>/paytoggle code</code>","<code>/payedit code|name|emoji|currency|instructions</code>"]
+        text="\n".join(lines)
+    elif key=="balances":
+        rows=db.pending_balances();text="💵 <b>BALANCE REQUESTS</b>\n━━━━━━━━━━━━━━━━\n"+("\n".join(f"#{r['request_id']} User {r['user_id']} • {r['amount']} {r['currency']} → {money(r['usd_amount'] or r['amount'])}" for r in rows) or "None.")
+    elif key=="orders":
+        rows=db.pending_orders();text="🧾 <b>ORDERS</b>\n━━━━━━━━━━━━━━━━\n"+("\n".join(f"#{r['order_id']} User {r['user_id']} • {r['product_name']} • {money(r['total'])} • {r['status']}" for r in rows) or "No pending orders.")
+    elif key=="users":
+        text="👥 <b>USERS</b>\n\n<code>/user USER_ID</code>\n<code>/users SEARCH</code>\n<code>/block USER_ID|reason</code>\n<code>/unblock USER_ID</code>\n<code>/disable USER_ID</code>"
+    elif key=="refs":
+        text=f"🎁 <b>REFERRALS</b>\n\nCommission: {float(db.setting('REFERRAL_RATE','0.05'))*100:.2f}%\nDeposit limit: {db.setting('REFERRAL_DEPOSIT_LIMIT','10')}\n\n<code>/refrate 7.5</code>\n<code>/reflimit 20</code>"
+    elif key=="settings":
+        text=f"⚙️ <b>SETTINGS</b>\n\nUSD/BDT: {db.setting('USD_BDT_RATE','127')}\nLow stock: {db.setting('LOW_STOCK_THRESHOLD','5')}\nBalance min/max: {db.setting('BALANCE_MIN','0.10')} / {db.setting('BALANCE_MAX','10000')}\nSupport: {db.setting('SUPPORT_USERNAME','@JanKug')}\n\n<code>/bdtrate 127</code>\n<code>/lowstock 5</code>\n<code>/support @JanKug</code>"
+    elif key=="buttons":
+        text="🎛️ <b>BUTTON MANAGER</b>\n\n<code>/setbutton key|new text|row|column|1</code>\nKeys: profile, products, orders, balance, refer, support"
+    elif key=="broadcast":
+        text="📢 <b>BROADCAST</b>\n\nUse:\n<code>/broadcast your message</code>"
+    elif key=="support":
+        text=f"🎧 <b>SUPPORT</b>\nCurrent: {SUPPORT}\n\n<code>/support @username</code>"
+    else:text="Admin Panel"
+    await q.edit_message_text(text,parse_mode="HTML",reply_markup=admin_kb())
+
+async def addstock_cmd(update,context):
+    if not is_admin(update.effective_user.id):return
+    raw=" ".join(context.args)
+    parts=raw.split("|",2)
+    if len(parts)!=3:return await update.message.reply_text("Format: /addstock product_id|email|password")
+    pid,email,pw=parts
+    if not db.get_product(pid):return await update.message.reply_text("❌ Product not found.")
+    db.add_stock(pid,email,pw);await update.message.reply_text("✅ Stock added.")
+
+async def product_cmd(update,context):
+    if not is_admin(update.effective_user.id):return
+    parts=" ".join(context.args).split("|")
+    if len(parts)<5:return await update.message.reply_text("Format: /addproduct id|category|group|name|price|active|coming_soon")
+    parts += ["1","0"]
+    try:db.add_product(parts[0],parts[1],parts[2],parts[3],float(parts[4]),int(parts[5]),int(parts[6]))
+    except Exception as e:return await update.message.reply_text(f"❌ {e}")
+    await update.message.reply_text("✅ Product added.")
+
+async def text_admin_cmd(update,context):
+    if not is_admin(update.effective_user.id):return False
+    t=update.message.text.strip()
+    if t.startswith("/price "):
+        p=t[7:].split("|",1)
+        if len(p)==2:
+            ok=db.update_product(p[0],price=float(p[1]));await update.message.reply_text("✅ Price updated." if ok else "❌ Product not found.")
+        return True
+    if t.startswith("/toggle "):
+        pid=t[8:].strip();p=db.get_product(pid)
+        if p:db.update_product(pid,active=0 if p["active"] else 1,coming_soon=0 if p["active"] else p["coming_soon"]);await update.message.reply_text("✅ Product toggled.")
+        return True
+    if t.startswith("/rename "):
+        p=t[8:].split("|",1)
+        if len(p)==2:await update.message.reply_text("✅ Renamed." if db.update_product(p[0],name=p[1]) else "❌ Product not found.")
+        return True
+    if t.startswith("/addcategory "):
+        name=t[13:].strip()
+        pid="cat_"+str(abs(hash(name))%100000000)
+        try:db.add_product(pid,name,"",name,0,0,1);await update.message.reply_text("✅ Category created. Add products under it with /addproduct.")
+        except:await update.message.reply_text("❌ Category already exists or invalid.")
+        return True
+    if t.startswith("/addpayment "):
+        p=t[12:].split("|",4)
+        if len(p)!=5:return await update.message.reply_text("Format: /addpayment code|name|emoji|currency|instructions")
+        try:db.add_payment(*p);await update.message.reply_text("✅ Payment method added. It is now available to enable/edit from Payment Methods.")
+        except Exception as e:await update.message.reply_text(f"❌ {e}")
+        return True
+    if t.startswith("/paytoggle "):
+        code=t[11:].strip();m=db.get_payment(code)
+        if not m:return await update.message.reply_text("❌ Method not found.")
+        db.update_payment(code,enabled=0 if m["enabled"] else 1);await update.message.reply_text("✅ Payment method toggled.")
+        return True
+    if t.startswith("/payedit "):
+        p=t[9:].split("|",4)
+        if len(p)!=5:return await update.message.reply_text("Format: /payedit code|name|emoji|currency|instructions")
+        ok=db.update_payment(p[0],name=p[1],emoji=p[2],currency=p[3],instructions=p[4]);await update.message.reply_text("✅ Updated." if ok else "❌ Method not found.")
+        return True
+    if t.startswith("/refrate "):
+        try:
+            v=float(t[9:].strip()); assert 0<=v<=100
+            db.set_setting("REFERRAL_RATE",v/100);await update.message.reply_text(f"✅ Referral commission set to {v:.2f}%")
+        except:await update.message.reply_text("❌ Use a percentage from 0 to 100.")
+        return True
+    if t.startswith("/reflimit "):
+        try:
+            v=int(t[10:].strip()); assert v>=0
+            db.set_setting("REFERRAL_DEPOSIT_LIMIT",v);await update.message.reply_text(f"✅ Referral deposit limit set to {v}.")
+        except:await update.message.reply_text("❌ Invalid limit.")
+        return True
+    if t.startswith("/bdtrate "):
+        try:
+            v=float(t[9:].strip()); assert v>0
+            db.set_setting("USD_BDT_RATE",v);await update.message.reply_text(f"✅ $1 = ৳{v:g}")
+        except:await update.message.reply_text("❌ Invalid rate.")
+        return True
+    if t.startswith("/lowstock "):
+        try:db.set_setting("LOW_STOCK_THRESHOLD",int(t[10:].strip()));await update.message.reply_text("✅ Low-stock threshold updated.")
+        except:await update.message.reply_text("❌ Invalid value.")
+        return True
+    if t.startswith("/support "):
+        global SUPPORT
+        SUPPORT=t[9:].strip();db.set_setting("SUPPORT_USERNAME",SUPPORT);await update.message.reply_text("✅ Support updated.")
+        return True
+    if t.startswith("/setbutton "):
+        p=t[11:].split("|",4)
+        if len(p)!=5:return await update.message.reply_text("Format: /setbutton key|text|row|column|1")
+        db.set_button(p[0],p[1],int(p[2]),int(p[3]),int(p[4]));await update.message.reply_text("✅ Button updated.")
+        return True
+    if t.startswith("/user "):
+        try:
+            u=db.get_user(int(t[6:].strip()))
+            if not u:return await update.message.reply_text("❌ User not found.")
+            return await update.message.reply_text(f"👤 {u['name']}\nID: {u['user_id']}\nUsername: @{u['username'] or 'N/A'}\nBalance: {money(u['balance'])}\nBlocked: {u['blocked']}\nDisabled: {u['disabled']}")
+        except:return await update.message.reply_text("❌ Invalid ID.")
+    if t.startswith("/users "):
+        rows=db.search_users(t[7:].strip());return await update.message.reply_text("\n".join(f"{u['user_id']} | {u['name']} | @{u['username'] or 'N/A'} | {money(u['balance'])}" for u in rows) or "No users.")
+    if t.startswith("/block "):
+        p=t[7:].split("|",1)
+        try:
+            uid=int(p[0]);reason=p[1] if len(p)>1 else "Admin action";db.set_user_state(uid,blocked=1,reason=reason);await update.message.reply_text("✅ User blocked.")
+        except:await update.message.reply_text("❌ Invalid user.")
+        return True
+    if t.startswith("/unblock "):
+        try:db.set_user_state(int(t[9:].strip()),blocked=0,reason="");await update.message.reply_text("✅ User unblocked.")
+        except:await update.message.reply_text("❌ Invalid user.")
+        return True
+    if t.startswith("/disable "):
+        try:db.set_user_state(int(t[9:].strip()),disabled=1);await update.message.reply_text("✅ User disabled.")
+        except:await update.message.reply_text("❌ Invalid user.")
+        return True
+    if t.startswith("/broadcast "):
+        msg=t[11:].strip();sent=failed=0
+        for uid in db.all_user_ids():
+            try:await context.bot.send_message(uid,msg);sent+=1
+            except:failed+=1
+        await update.message.reply_text(f"📢 Broadcast complete.\n✅ Sent: {sent}\n❌ Failed: {failed}");return True
+    return False
+
+async def text_handler(update,context):
+    # Admin commands that use ordinary text.
+    if update.message.text.startswith("/") and await text_admin_cmd(update,context):return
+    if "custom_pid" in context.user_data:
+        pid=context.user_data.pop("custom_pid")
+        try:qty=int(update.message.text.strip())
+        except:return await update.message.reply_text("❌ Enter a whole number.")
+        p=db.get_product(pid)
+        if not p:return await update.message.reply_text("❌ Product not found.")
+        st=db.stock_count(pid)
+        if qty>st:return await update.message.reply_text(f"❌ Requested {qty}, available {st}.")
+        total=round(float(p["price"])*qty,2);u=db.get_user(update.effective_user.id)
+        if float(u["balance"])>=total:
+            oid=db.create_order(update.effective_user.id,pid,qty,total,"Balance")
+            items,new=db.purchase_balance(update.effective_user.id,pid,qty,total)
+            if items:return await update.message.reply_text(delivery(p,items,total,"Balance"),parse_mode="HTML")
+        oid=db.create_order(update.effective_user.id,pid,qty,total,None)
+        ms=db.payment_methods(True);kb=[[InlineKeyboardButton(f"{m['emoji']} {m['name']}",callback_data=f"pay:{oid}:{m['code']}")] for m in ms]
+        return await update.message.reply_text(f"💳 Choose payment method for <b>{p['name']}</b>\nTotal: <b>{money(total)}</b>",parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
+    if "bal_method" in context.user_data:
+        code=context.user_data.pop("bal_method");m=db.get_payment(code)
+        try:amount=float(update.message.text.strip())
+        except:return await update.message.reply_text("❌ Enter a valid amount.")
+        if amount<=0:return await update.message.reply_text("❌ Amount must be greater than 0.")
+        if m["currency"]=="BDT":
+            rate=float(db.setting("USD_BDT_RATE","127"));usd=round(amount/rate,2)
+        else:rate=1;usd=round(amount,2)
+        mn=float(db.setting("BALANCE_MIN","0.10"));mx=float(db.setting("BALANCE_MAX","10000"))
+        if usd<mn or usd>mx:return await update.message.reply_text(f"❌ USD credit must be between {money(mn)} and {money(mx)}.")
+        rid=db.create_balance_request(update.effective_user.id,amount,m["currency"],usd,rate,code)
+        await update.message.reply_text(f"💳 <b>{m['name']}</b>\nAmount: <b>{amount:g} {m['currency']}</b>\nRate: $1 = ৳{rate:g}\nUSD Credit: <b>{money(usd)}</b>\nRequest: <code>#{rid}</code>\n\n{m['instructions']}",parse_mode="HTML",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ I Have Paid",callback_data=f"balpaid:{rid}")],[InlineKeyboardButton("❌ Cancel",callback_data="home")]]))
         return
-    await q.answer()
-    await q.edit_message_text(
-        "🛠️ ADMIN PANEL\n━━━━━━━━━━━━━━━━\n\nChoose an admin action:",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📊 Dashboard", callback_data="admin_dashboard")],
-            [InlineKeyboardButton("📦 Stock", callback_data="admin_stock")],
-            [InlineKeyboardButton("💰 Payments", callback_data="admin_payments")],
-            [InlineKeyboardButton("💳 Balance Requests", callback_data="admin_balances")],
-            [InlineKeyboardButton("🧾 Orders", callback_data="admin_orders")],
-            [InlineKeyboardButton("👥 Users", callback_data="admin_users")],
-            [InlineKeyboardButton("🎁 Referrals", callback_data="admin_refs")],
-            [InlineKeyboardButton("⬅️ Main Menu", callback_data="home")],
-        ]),
-    )
+    await update.message.reply_text("🏠 Use /start to open the menu.")
 
+async def error(update,context):log.exception("Unhandled error",exc_info=context.error)
 
-async def addstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
+def main():
+    if not TOKEN:raise RuntimeError("BOT_TOKEN is missing in Railway Variables.")
+    db.init_db()
+    app=Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start",start))
+    app.add_handler(CommandHandler("myid",myid))
+    app.add_handler(CommandHandler("admin",admin_cmd))
+    app.add_handler(CommandHandler("addstock",addstock_cmd))
+    app.add_handler(CommandHandler("addproduct",product_cmd))
+    app.add_handler(CallbackQueryHandler(home,pattern=r"^home$"))
+    app.add_handler(CallbackQueryHandler(customer_cb,pattern=r"^(profile|products|orders|balance|refer|support)$"))
+    app.add_handler(CallbackQueryHandler(category_cb,pattern=r"^cat:"))
+    app.add_handler(CallbackQueryHandler(group_cb,pattern=r"^grp:"))
+    app.add_handler(CallbackQueryHandler(product_cb,pattern=r"^prd:"))
+    app.add_handler(CallbackQueryHandler(quantity_cb,pattern=r"^qty:"))
+    app.add_handler(CallbackQueryHandler(custom_cb,pattern=r"^custom:"))
+    app.add_handler(CallbackQueryHandler(pay_method_cb,pattern=r"^pay:"))
+    app.add_handler(CallbackQueryHandler(paid_cb,pattern=r"^paid:"))
+    app.add_handler(CallbackQueryHandler(balance_method_cb,pattern=r"^balmethod:"))
+    app.add_handler(CallbackQueryHandler(showbal,pattern=r"^showbal$"))
+    app.add_handler(CallbackQueryHandler(balpaid_cb,pattern=r"^balpaid:"))
+    app.add_handler(CallbackQueryHandler(approve_cb,pattern=r"^approve:"))
+    app.add_handler(CallbackQueryHandler(reject_cb,pattern=r"^reject:"))
+    app.add_handler(CallbackQueryHandler(bapprove_cb,pattern=r"^bapprove:"))
+    app.add_handler(CallbackQueryHandler(breject_cb,pattern=r"^breject:"))
+    app.add_handler(CallbackQueryHandler(admin_cb,pattern=r"^ad:"))
+    app.add_handler(MessageHandler(filters.TEXT, text_handler))
+    app.add_error_handler(error)
+    app.run_polling(drop_pending_updates=True)
 
-    if len(context.args) != 3:
-        await update.message.reply_text(
-            "Usage:\n/addstock <product_id> <email> <password>"
-        )
-        return
-
-    pid, email, password = context.args
-
-    if pid not in PRODUCTS:
-        await update.message.reply_text("❌ Unknown product_id.")
-        return
-
-    db.add_stock(pid, email, password)
-    await update.message.reply_text("✅ Stock added successfully.")
-
-
-async def stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-
-    rows = db.get_products_stock()
-    if not rows:
-        await update.message.reply_text("📦 Stock is empty.")
-        return
-
-    text = "📦 AVAILABLE STOCK\n━━━━━━━━━━━━━━━━\n"
-    for r in rows:
-        p = PRODUCTS.get(r["product_id"], {"name": r["product_id"]})
-        text += f"{p['name']}: {r['c']}\n"
-
-    await update.message.reply_text(text)
-
-
-async def orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-
-    await update.message.reply_text(
-        "📦 ADMIN ORDERS\n\n"
-        "Payment reports will appear here in Telegram when customers press 'I Have Paid'."
-    )
-
-
-def run():
-    app = Application.builder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("myid", myid))
-    app.add_handler(CommandHandler("admin", admin_command))
-    app.add_handler(CommandHandler("addstock", addstock))
-    app.add_handler(CommandHandler("stock", stock))
-    app.add_handler(CommandHandler("orders", orders))
-    app.add_handler(CallbackQueryHandler(admin_back, pattern=r"^admin_back$"))
-    app.add_handler(CallbackQueryHandler(admin_menu_callback, pattern=r"^admin_(dashboard|stock|payments|balances|orders|users|refs)$"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    app.add_handler(CallbackQueryHandler(callback))
-
-    print("Bot is running...")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    run()
+if __name__=="__main__":main()
