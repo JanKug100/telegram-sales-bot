@@ -16,11 +16,28 @@ TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SUPPORT = os.getenv("SUPPORT_USERNAME", "YourSupportUsername").strip()
 BINANCE_PAY_ID = os.getenv("BINANCE_PAY_ID", "").strip()
 
-ADMIN_IDS = {
-    int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "").split(",")
-    if x.strip().isdigit()
-}
+def load_admin_ids():
+    raw = os.getenv("ADMIN_IDS", "")
+    ids = set()
+    for part in raw.replace(",", " ").split():
+        try:
+            ids.add(int(part.strip()))
+        except (TypeError, ValueError):
+            pass
+    return ids
+
+
+def get_admin_ids():
+    # Reload on every admin command so Railway variable changes are picked up
+    # after a restart without relying on a stale module-level value.
+    return load_admin_ids()
+
+
+def is_admin(user_id):
+    return int(user_id) in get_admin_ids()
+
+
+ADMIN_IDS = load_admin_ids()
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Put it in Railway Variables.")
@@ -454,7 +471,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         ])
 
-        for admin_id in ADMIN_IDS:
+        for admin_id in get_admin_ids():
             try:
                 await context.bot.send_message(
                     chat_id=admin_id,
@@ -475,7 +492,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("approve:"):
-        if u.id not in ADMIN_IDS:
+        if not is_admin(u.id):
             await q.answer("⛔ Admin only.", show_alert=True)
             return
 
@@ -548,7 +565,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("reject:"):
-        if u.id not in ADMIN_IDS:
+        if not is_admin(u.id):
             await q.answer("⛔ Admin only.", show_alert=True)
             return
 
@@ -687,7 +704,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("✅ Approve", callback_data=f"balapprove:{request_id}"),
             InlineKeyboardButton("❌ Reject", callback_data=f"balreject:{request_id}"),
         ]])
-        for admin_id in ADMIN_IDS:
+        for admin_id in get_admin_ids():
             try:
                 await context.bot.send_message(chat_id=admin_id, text=admin_text, reply_markup=admin_kb)
             except Exception as e:
@@ -703,7 +720,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("balapprove:"):
-        if u.id not in ADMIN_IDS:
+        if not is_admin(u.id):
             await q.answer("⛔ Admin only.", show_alert=True)
             return
         request_id = data.split(":", 1)[1]
@@ -743,7 +760,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("balreject:"):
-        if u.id not in ADMIN_IDS:
+        if not is_admin(u.id):
             await q.answer("⛔ Admin only.", show_alert=True)
             return
         request_id = data.split(":", 1)[1]
@@ -846,8 +863,132 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    ids = get_admin_ids()
+    await update.message.reply_text(
+        "🆔 YOUR TELEGRAM ID\n"
+        "━━━━━━━━━━━━━━━━\n\n"
+        f"<code>{uid}</code>\n\n"
+        f"Admin status: {'✅ YES' if uid in ids else '❌ NO'}\n"
+        f"Loaded ADMIN_IDS: <code>{', '.join(map(str, sorted(ids))) or 'EMPTY'}</code>",
+        parse_mode="HTML",
+    )
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    ids = get_admin_ids()
+
+    if uid not in ids:
+        await update.message.reply_text(
+            "⛔ ADMIN ACCESS DENIED\n"
+            "━━━━━━━━━━━━━━━━\n\n"
+            f"Your Telegram ID:\n<code>{uid}</code>\n\n"
+            f"Loaded ADMIN_IDS:\n<code>{', '.join(map(str, sorted(ids))) or 'EMPTY'}</code>\n\n"
+            "If this is your ID, put it in Railway → Variables → ADMIN_IDS, "
+            "then redeploy/restart the service.",
+            parse_mode="HTML",
+        )
+        return
+
+    await update.message.reply_text(
+        "🛠️ ADMIN PANEL\n"
+        "━━━━━━━━━━━━━━━━\n\n"
+        "Choose an admin action:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 Dashboard", callback_data="admin_dashboard")],
+            [InlineKeyboardButton("📦 Stock", callback_data="admin_stock")],
+            [InlineKeyboardButton("💰 Payments", callback_data="admin_payments")],
+            [InlineKeyboardButton("💳 Balance Requests", callback_data="admin_balances")],
+            [InlineKeyboardButton("🧾 Orders", callback_data="admin_orders")],
+            [InlineKeyboardButton("👥 Users", callback_data="admin_users")],
+            [InlineKeyboardButton("🎁 Referrals", callback_data="admin_refs")],
+            [InlineKeyboardButton("⬅️ Main Menu", callback_data="home")],
+        ]),
+    )
+
+
+async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_admin(q.from_user.id):
+        await q.answer("⛔ Admin only.", show_alert=True)
+        return
+    await q.answer()
+    data = q.data
+
+    if data == "admin_dashboard":
+        try:
+            rows = db.get_products_stock()
+            users = db.get_all_users_count() if hasattr(db, "get_all_users_count") else None
+            text = "📊 ADMIN DASHBOARD\n━━━━━━━━━━━━━━━━\n\n"
+            if users is not None:
+                text += f"👥 Users: {users}\n"
+            text += f"📦 Product types: {len(rows)}\n"
+            text += "\nUse /stock for exact available stock."
+        except Exception as e:
+            text = f"📊 ADMIN DASHBOARD\n\nCould not load dashboard: {e}"
+    elif data == "admin_stock":
+        rows = db.get_products_stock()
+        if not rows:
+            text = "📦 STOCK\n━━━━━━━━━━━━━━━━\n\nStock is empty."
+        else:
+            text = "📦 STOCK\n━━━━━━━━━━━━━━━━\n\n"
+            for r in rows:
+                p = PRODUCTS.get(r["product_id"], {"name": r["product_id"]})
+                text += f"• {p['name']}: {r['c']}\n"
+    elif data == "admin_payments":
+        text = "💰 PAYMENTS\n━━━━━━━━━━━━━━━━\n\nPending payment reports appear here when customers press I Have Paid."
+    elif data == "admin_balances":
+        text = "💳 BALANCE REQUESTS\n━━━━━━━━━━━━━━━━\n\nBalance payment reports appear here when customers press I Have Paid."
+    elif data == "admin_orders":
+        text = "🧾 ORDERS\n━━━━━━━━━━━━━━━━\n\nUse /orders to open the admin order view."
+    elif data == "admin_users":
+        text = "👥 USERS\n━━━━━━━━━━━━━━━━\n\nUse /myid to verify your own Telegram ID."
+    elif data == "admin_refs":
+        rate = float(db.get_setting("REFERRAL_RATE", "0.05"))
+        limit = int(db.get_setting("REFERRAL_DEPOSIT_LIMIT", "10"))
+        text = (
+            "🎁 REFERRALS\n━━━━━━━━━━━━━━━━\n\n"
+            f"Commission: {rate * 100:.2f}%\n"
+            f"Deposit limit: first {limit}\n\n"
+            "Change: /refrate 7.5 or /reflimit 20"
+        )
+    else:
+        text = "🛠️ ADMIN PANEL"
+
+    await q.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Admin Panel", callback_data="admin_back")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="home")],
+        ]),
+    )
+
+
+async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_admin(q.from_user.id):
+        await q.answer("⛔ Admin only.", show_alert=True)
+        return
+    await q.answer()
+    await q.edit_message_text(
+        "🛠️ ADMIN PANEL\n━━━━━━━━━━━━━━━━\n\nChoose an admin action:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 Dashboard", callback_data="admin_dashboard")],
+            [InlineKeyboardButton("📦 Stock", callback_data="admin_stock")],
+            [InlineKeyboardButton("💰 Payments", callback_data="admin_payments")],
+            [InlineKeyboardButton("💳 Balance Requests", callback_data="admin_balances")],
+            [InlineKeyboardButton("🧾 Orders", callback_data="admin_orders")],
+            [InlineKeyboardButton("👥 Users", callback_data="admin_users")],
+            [InlineKeyboardButton("🎁 Referrals", callback_data="admin_refs")],
+            [InlineKeyboardButton("⬅️ Main Menu", callback_data="home")],
+        ]),
+    )
+
+
 async def addstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if not is_admin(update.effective_user.id):
         return
 
     if len(context.args) != 3:
@@ -867,7 +1008,7 @@ async def addstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if not is_admin(update.effective_user.id):
         return
 
     rows = db.get_products_stock()
@@ -884,7 +1025,7 @@ async def stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if not is_admin(update.effective_user.id):
         return
 
     await update.message.reply_text(
@@ -897,9 +1038,13 @@ def run():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("myid", myid))
+    app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("addstock", addstock))
     app.add_handler(CommandHandler("stock", stock))
     app.add_handler(CommandHandler("orders", orders))
+    app.add_handler(CallbackQueryHandler(admin_back, pattern=r"^admin_back$"))
+    app.add_handler(CallbackQueryHandler(admin_menu_callback, pattern=r"^admin_(dashboard|stock|payments|balances|orders|users|refs)$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(CallbackQueryHandler(callback))
 
