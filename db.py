@@ -144,7 +144,10 @@ def init_db():
                         (k,t,i//2,i%2))
 
 def setting(key, default=None):
+    # Self-healing guard: Railway may reuse an older sales_bot.db.
+    # Always ensure the settings table exists before reading it.
     with conn() as con:
+        con.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         r=con.execute("SELECT value FROM settings WHERE key=?",(key,)).fetchone()
         return r["value"] if r else default
 
