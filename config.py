@@ -1,51 +1,9 @@
-# JanKug Store V3 - seed catalog
-# Prices marked 0 are disabled/Coming Soon until an admin sets a real price.
 
-PRODUCTS = {
-    "gv_old": {"category":"📱 Communication Apps","group_name":"Google Voice","name":"Old Gv","price":5.00,"active":1,"coming_soon":0},
-    "gv_new": {"category":"📱 Communication Apps","group_name":"Google Voice","name":"New Gv","price":3.50,"active":1,"coming_soon":0},
-    "tn_web": {"category":"📱 Communication Apps","group_name":"TextNow","name":"Web Tn","price":3.00,"active":1,"coming_soon":0},
-    "tn_phone": {"category":"📱 Communication Apps","group_name":"TextNow","name":"Phone Tn","price":1.70,"active":1,"coming_soon":0},
-    "tf_web": {"category":"📱 Communication Apps","group_name":"TextFree","name":"Web Tf","price":2.00,"active":1,"coming_soon":0},
-    "tf_phone": {"category":"📱 Communication Apps","group_name":"TextFree","name":"Phone Tf","price":2.00,"active":1,"coming_soon":0},
-    "talkatone": {"category":"📱 Communication Apps","group_name":"","name":"Talkatone","price":2.00,"active":1,"coming_soon":0},
-    "textplus": {"category":"📱 Communication Apps","group_name":"","name":"TextPlus","price":2.00,"active":1,"coming_soon":0},
-
-    "expressvpn_3": {"category":"🔐 VPN & Proxy","group_name":"03 days","name":"Express VPN","price":0,"active":0,"coming_soon":1},
-    "cyberghost_3": {"category":"🔐 VPN & Proxy","group_name":"03 days","name":"CyberGhost VPN","price":0,"active":0,"coming_soon":1},
-    "vyprvpn_3": {"category":"🔐 VPN & Proxy","group_name":"03 days","name":"Vypr VPN","price":0,"active":0,"coming_soon":1},
-    "pandavpn_3": {"category":"🔐 VPN & Proxy","group_name":"03 days","name":"Panda VPN","price":0,"active":0,"coming_soon":1},
-    "nordvpn_7": {"category":"🔐 VPN & Proxy","group_name":"07 days","name":"Nord VPN","price":1.50,"active":1,"coming_soon":0},
-    "surfshark_7": {"category":"🔐 VPN & Proxy","group_name":"07 days","name":"Surfshark VPN","price":0,"active":0,"coming_soon":1},
-    "piavpn_7": {"category":"🔐 VPN & Proxy","group_name":"07 days","name":"PIA VPN","price":1.50,"active":1,"coming_soon":0},
-    "ipvanish_7": {"category":"🔐 VPN & Proxy","group_name":"07 days","name":"IPVanish VPN","price":0,"active":0,"coming_soon":1},
-    "hotspotshield_7": {"category":"🔐 VPN & Proxy","group_name":"07 days","name":"HotspotShield VPN","price":0,"active":0,"coming_soon":1},
-    "avastvpn_7": {"category":"🔐 VPN & Proxy","group_name":"07 days","name":"Avast VPN","price":0,"active":0,"coming_soon":1},
-    "hmavpn_7": {"category":"🔐 VPN & Proxy","group_name":"07 days","name":"HMA VPN","price":0,"active":0,"coming_soon":1},
-    "purevpn_7": {"category":"🔐 VPN & Proxy","group_name":"07 days","name":"Pure VPN","price":0,"active":0,"coming_soon":1},
-    "turbovpn_7": {"category":"🔐 VPN & Proxy","group_name":"07 days","name":"Turbo VPN","price":0,"active":0,"coming_soon":1},
-    "bitdefender_7": {"category":"🔐 VPN & Proxy","group_name":"07 days","name":"Bitdefender VPN","price":0,"active":0,"coming_soon":1},
-    "adguard_7": {"category":"🔐 VPN & Proxy","group_name":"07 days","name":"AdGuard VPN","price":0,"active":0,"coming_soon":1},
-    "norton_7": {"category":"🔐 VPN & Proxy","group_name":"07 days","name":"Norton VPN","price":0,"active":0,"coming_soon":1},
-    "avg_7": {"category":"🔐 VPN & Proxy","group_name":"07 days","name":"AVG VPN","price":0,"active":0,"coming_soon":1},
-    "xvpn_7": {"category":"🔐 VPN & Proxy","group_name":"07 days","name":"X-VPN","price":0,"active":0,"coming_soon":1},
-    "skyvpn_7": {"category":"🔐 VPN & Proxy","group_name":"07 days","name":"Sky VPN","price":0,"active":0,"coming_soon":1},
-    "potato_7": {"category":"🔐 VPN & Proxy","group_name":"07 days","name":"Potato VPN","price":0,"active":0,"coming_soon":1},
-    "expressvpn_7": {"category":"🔐 VPN & Proxy","group_name":"07 days","name":"Express VPN","price":1.50,"active":1,"coming_soon":0},
-    "octohide_14": {"category":"🔐 VPN & Proxy","group_name":"14 days","name":"Octohide","price":0,"active":0,"coming_soon":1},
-    "expressvpn_30": {"category":"🔐 VPN & Proxy","group_name":"30 days","name":"Express VPN (1 Device)","price":0,"active":0,"coming_soon":1},
-    "nordvpn_30": {"category":"🔐 VPN & Proxy","group_name":"30 days","name":"NordVPN","price":0,"active":0,"coming_soon":1},
-    "protonvpn_30": {"category":"🔐 VPN & Proxy","group_name":"30 days","name":"Proton VPN","price":0,"active":0,"coming_soon":1},
-    "avastvpn_30": {"category":"🔐 VPN & Proxy","group_name":"30 days","name":"Avast VPN","price":0,"active":0,"coming_soon":1},
-    "bitdefender_30": {"category":"🔐 VPN & Proxy","group_name":"30 days","name":"Bitdefender VPN","price":0,"active":0,"coming_soon":1},
-    "hmavpn_30": {"category":"🔐 VPN & Proxy","group_name":"30 days","name":"HMA VPN","price":0,"active":0,"coming_soon":1},
-    "mysterium_30": {"category":"🔐 VPN & Proxy","group_name":"30 days","name":"Mysterium VPN","price":0,"active":0,"coming_soon":1},
-    "mysterium_dark_30": {"category":"🔐 VPN & Proxy","group_name":"30 days","name":"MYSTERIUM DARK","price":0,"active":0,"coming_soon":1},
-    "windscribe_30": {"category":"🔐 VPN & Proxy","group_name":"30 days","name":"Windscribe VPN","price":0,"active":0,"coming_soon":1},
-    "pia_30": {"category":"🔐 VPN & Proxy","group_name":"30 days","name":"PIA VPN (1 device)","price":0,"active":0,"coming_soon":1},
-
-    "whatsapp": {"category":"📲 Verification Service","group_name":"","name":"WhatsApp","price":2.00,"active":0,"coming_soon":1},
-    "telegram": {"category":"📲 Verification Service","group_name":"","name":"Telegram","price":2.00,"active":0,"coming_soon":1},
-    "signal": {"category":"📲 Verification Service","group_name":"","name":"Signal","price":1.00,"active":0,"coming_soon":1},
-    "viber": {"category":"📲 Verification Service","group_name":"","name":"Viber","price":1.00,"active":0,"coming_soon":1},
-}
+import os
+BOT_TOKEN=os.getenv("BOT_TOKEN","")
+ADMIN_IDS=os.getenv("ADMIN_IDS","")
+SUPPORT_USERNAME=os.getenv("SUPPORT_USERNAME","@JanKug")
+BINANCE_PAY_ID=os.getenv("BINANCE_PAY_ID","")
+BINANCE_PAY_API_KEY=os.getenv("BINANCE_PAY_API_KEY","")
+BINANCE_PAY_SECRET=os.getenv("BINANCE_PAY_SECRET","")
+BINANCE_PAY_CURRENCY=os.getenv("BINANCE_PAY_CURRENCY","USDT")
