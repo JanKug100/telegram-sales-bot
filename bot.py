@@ -9,10 +9,6 @@ log=logging.getLogger("jankug-v3")
 
 TOKEN=os.getenv("BOT_TOKEN","").strip()
 ADMIN_IDS={int(x) for x in os.getenv("ADMIN_IDS","").replace(","," ").split() if x.strip().isdigit()}
-
-# Initialize/migrate SQLite BEFORE reading settings. This is required when Railway
-# already has an older sales_bot.db that does not yet contain the settings table.
-db.init_db()
 SUPPORT=os.getenv("SUPPORT_USERNAME",db.setting("SUPPORT_USERNAME","@JanKug")).strip()
 BINANCE_PAY_ID=os.getenv("BINANCE_PAY_ID","").strip()
 
