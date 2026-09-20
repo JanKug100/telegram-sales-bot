@@ -70,42 +70,25 @@ async def my_profile(
 
     user = update.effective_user
 
-    # ------------------------------------------
     # Telegram Name
-    # ------------------------------------------
-
     telegram_name = user.full_name
 
-    # ------------------------------------------
     # Telegram Username
-    # ------------------------------------------
-
     if user.username:
         username = f"@{user.username}"
     else:
         username = "@N/A"
 
-    # ------------------------------------------
     # Telegram User ID
-    # ------------------------------------------
-
     user_id = user.id
 
-    # ------------------------------------------
-    # Current temporary values
-    #
-    # এগুলো এখন default value।
-    # পরবর্তীতে Database থেকে আসবে।
-    # ------------------------------------------
-
+    # Temporary values
+    # পরবর্তীতে Database থেকে আসবে
     balance = 0.00
     total_refs = 0
     ref_income = 0.00
 
-    # ------------------------------------------
     # Referral Link
-    # ------------------------------------------
-
     bot_username = context.bot.username
 
     if bot_username:
@@ -115,10 +98,7 @@ async def my_profile(
     else:
         referral_link = "Referral link unavailable"
 
-    # ------------------------------------------
     # Account Dashboard
-    # ------------------------------------------
-
     profile_text = (
         "👤 ACCOUNT DASHBOARD\n"
         "━━━━━━━━━━━━━━━━\n"
@@ -128,8 +108,8 @@ async def my_profile(
         "━━━━━━━━━━━━━━━━\n"
         f"💳 Balance: ${balance:.2f}\n"
         f"🎯 Ref Link: {referral_link} "
-f"[Refer {REFERRAL_COMMISSION}% commission "
-f"{{first {REFERRAL_DEPOSIT_LIMIT} time deposit}}]\n"
+        f"[Refer {REFERRAL_COMMISSION}% commission "
+        f"{{first {REFERRAL_DEPOSIT_LIMIT} time deposit}}]\n"
         f"📊 Total Refs: {total_refs}\n"
         f"🎁 Ref Income: ${ref_income:.2f}"
     )
@@ -190,5 +170,4 @@ def main():
 # RUN
 # ==========================================
 
-if __name__ == "__main__":
-    main()
+if
