@@ -127,9 +127,9 @@ async def my_profile(
         f"🆔 User ID: {user_id}\n"
         "━━━━━━━━━━━━━━━━\n"
         f"💳 Balance: ${balance:.2f}\n"
-        f"🎯 Ref Link: {referral_link}\n"
-        f"💰 Refer {REFERRAL_COMMISSION}% commission "
-        f"{{first {REFERRAL_DEPOSIT_LIMIT} time deposit}}\n"
+        f"🎯 Ref Link: {referral_link} "
+f"[Refer {REFERRAL_COMMISSION}% commission "
+f"{{first {REFERRAL_DEPOSIT_LIMIT} time deposit}}]\n"
         f"📊 Total Refs: {total_refs}\n"
         f"🎁 Ref Income: ${ref_income:.2f}"
     )
