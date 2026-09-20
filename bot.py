@@ -157,30 +157,36 @@ async def buy_products(
 ):
 
     keyboard = [
-        [
-            InlineKeyboardButton(
-                "💬 Communication Apps",
-                callback_data="communication_apps"
-            ),
-            InlineKeyboardButton(
-                "🔐 VPN & Proxy",
-                callback_data="vpn_proxy"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🧑‍💻 Verification Service [coming soon]",
-                callback_data="verification_service"
-            )
-        ]
+    [
+        InlineKeyboardButton(
+            "💬 Communication Apps",
+            callback_data="communication_apps"
+        ),
+        InlineKeyboardButton(
+            "🔐 BUY VPN",
+            callback_data="buy_vpn"
+        )
+    ],
+    [
+        InlineKeyboardButton(
+            "🌐 BUY Proxy {Coming soon}",
+            callback_data="buy_proxy"
+        )
+    ],
+    [
+        InlineKeyboardButton(
+            "🧑‍💻 Verification Service {coming soon}",
+            callback_data="verification_service"
+        )
     ]
+]
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        "🛍️ BUY PRODUCTS",
-        reply_markup=reply_markup
-    )
+    "🛍️ Select a PRODUCT",
+    reply_markup=reply_markup
+)
 
 
 # ==========================================
