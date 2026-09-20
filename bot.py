@@ -10,22 +10,35 @@ from telegram.ext import (
 )
 
 
-# ==============================
+# ==========================================
 # BOT TOKEN
-# ==============================
+# ==========================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 
-# ==============================
+# ==========================================
+# REFERRAL SETTINGS
+# ==========================================
+
+# বর্তমানে Referral Commission 5%
+# ভবিষ্যতে Admin Panel থেকে পরিবর্তন করা যাবে।
+REFERRAL_COMMISSION = 5
+
+# প্রথম 10টি deposit-এর উপর referral commission
+REFERRAL_DEPOSIT_LIMIT = 10
+
+
+# ==========================================
 # MAIN MENU KEYBOARD
-# ==============================
+# ==========================================
 
 def main_menu_keyboard():
+
     keyboard = [
         ["🧑‍💼 My Profile", "🛍️ Buy Products"],
         ["💰 Add Balance", "📦 My Orders"],
-        ["👥 Refer", "🎧 Support"]
+        ["👥 Refer", "🎧 Support"],
     ]
 
     return ReplyKeyboardMarkup(
@@ -34,9 +47,9 @@ def main_menu_keyboard():
     )
 
 
-# ==============================
-# /START COMMAND
-# ==============================
+# ==========================================
+# /START
+# ==========================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -46,52 +59,77 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ==============================
+# ==========================================
 # MY PROFILE
-# ==============================
+# ==========================================
 
-async def my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def my_profile(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     user = update.effective_user
 
-    # Telegram name
-    name = user.full_name
+    # ------------------------------------------
+    # Telegram Name
+    # ------------------------------------------
 
-    # Telegram username
+    telegram_name = user.full_name
+
+    # ------------------------------------------
+    # Telegram Username
+    # ------------------------------------------
+
     if user.username:
         username = f"@{user.username}"
     else:
         username = "@N/A"
 
+    # ------------------------------------------
     # Telegram User ID
+    # ------------------------------------------
+
     user_id = user.id
 
-    # Temporary values
-    # এগুলো পরবর্তীতে Database/Admin Panel থেকে আসবে
-    balance = 10.00
-    total_refs = 20
-    ref_income = 5.00
-    commission = 5
+    # ------------------------------------------
+    # Current temporary values
+    #
+    # এগুলো এখন default value।
+    # পরবর্তীতে Database থেকে আসবে।
+    # ------------------------------------------
 
-    # Referral link
+    balance = 0.00
+    total_refs = 0
+    ref_income = 0.00
+
+    # ------------------------------------------
+    # Referral Link
+    # ------------------------------------------
+
     bot_username = context.bot.username
 
     if bot_username:
-        ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+        referral_link = (
+            f"https://t.me/{bot_username}?start=ref_{user_id}"
+        )
     else:
-        ref_link = f"ref_{user_id}"
+        referral_link = "Referral link unavailable"
+
+    # ------------------------------------------
+    # Account Dashboard
+    # ------------------------------------------
 
     profile_text = (
         "👤 ACCOUNT DASHBOARD\n"
         "━━━━━━━━━━━━━━━━\n"
-        f"🏷 Name: {name}\n"
+        f"🏷 Name: {telegram_name}\n"
         f"🔰 Username: {username}\n"
         f"🆔 User ID: {user_id}\n"
         "━━━━━━━━━━━━━━━━\n"
         f"💳 Balance: ${balance:.2f}\n"
-        f"🎯 Ref Link: {ref_link}\n"
-        f"💰 Refer {commission}% commission "
-        f"{{first 10 time deposit}}\n"
+        f"🎯 Ref Link: {referral_link}\n"
+        f"💰 Refer {REFERRAL_COMMISSION}% commission "
+        f"{{first {REFERRAL_DEPOSIT_LIMIT} time deposit}}\n"
         f"📊 Total Refs: {total_refs}\n"
         f"🎁 Ref Income: ${ref_income:.2f}"
     )
@@ -99,9 +137,9 @@ async def my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(profile_text)
 
 
-# ==============================
-# TEXT MESSAGE HANDLER
-# ==============================
+# ==========================================
+# MESSAGE HANDLER
+# ==========================================
 
 async def handle_message(
     update: Update,
@@ -113,24 +151,29 @@ async def handle_message(
 
     text = update.message.text
 
+    # My Profile button
     if text == "🧑‍💼 My Profile":
         await my_profile(update, context)
 
 
-# ==============================
+# ==========================================
 # START BOT
-# ==============================
+# ==========================================
 
 def main():
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
 
-    # /start
+    # /start command
     application.add_handler(
         CommandHandler("start", start)
     )
 
-    # Keyboard buttons
+    # Keyboard message handler
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -143,9 +186,9 @@ def main():
     application.run_polling()
 
 
-# ==============================
+# ==========================================
 # RUN
-# ==============================
+# ==========================================
 
 if __name__ == "__main__":
     main()
