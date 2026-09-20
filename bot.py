@@ -1,6 +1,6 @@
 import os
 
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -147,14 +147,25 @@ async def buy_products(
 ):
 
     keyboard = [
-        ["💬 Communication Apps", "🔐 VPN & Proxy"],
-        ["🧑‍💻 Verification Service [coming soon]"],
+        [
+            InlineKeyboardButton(
+                "💬 Communication Apps",
+                callback_data="communication_apps"
+            ),
+            InlineKeyboardButton(
+                "🔐 VPN & Proxy",
+                callback_data="vpn_proxy"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🧑‍💻 Verification Service [coming soon]",
+                callback_data="verification_service"
+            )
+        ]
     ]
 
-    reply_markup = ReplyKeyboardMarkup(
-        keyboard,
-        resize_keyboard=True
-    )
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
         "🛍️ BUY PRODUCTS",
