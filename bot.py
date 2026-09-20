@@ -138,6 +138,31 @@ async def my_profile(
 
 
 # ==========================================
+# BUY PRODUCTS MENU
+# ==========================================
+
+async def buy_products(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    keyboard = [
+        ["💬 Communication Apps", "🔐 VPN & Proxy"],
+        ["🧑‍💻 Verification Service [coming soon]"],
+    ]
+
+    reply_markup = ReplyKeyboardMarkup(
+        keyboard,
+        resize_keyboard=True
+    )
+
+    await update.message.reply_text(
+        "🛍️ BUY PRODUCTS",
+        reply_markup=reply_markup
+    )
+
+
+# ==========================================
 # MESSAGE HANDLER
 # ==========================================
 
@@ -151,10 +176,13 @@ async def handle_message(
 
     text = update.message.text
 
-    # My Profile button
+        # My Profile button
     if text == "🧑‍💼 My Profile":
         await my_profile(update, context)
 
+    # Buy Products button
+    elif text == "🛍️ Buy Products":
+        await buy_products(update, context)
 
 # ==========================================
 # START BOT
