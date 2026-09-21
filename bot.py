@@ -43,9 +43,26 @@ REFERRAL_DEPOSIT_LIMIT = 10
 def main_menu_keyboard():
 
     keyboard = [
-        ["🧑‍💼 My Profile", "🛍️ Buy Products"],
-        ["💰 Add Balance", "📦 My Orders"],
-        ["👥 Refer", "🎧 Support"],
+        [
+            "📱 Communication Apps",
+            "🔐 BUY VPN"
+        ],
+        [
+            "🧑‍💻 Verification Services",
+            "🌐 BUY Proxy"
+        ],
+        [
+            "🧑‍💼 My Profile",
+            "🛍️ Buy More Products"
+        ],
+        [
+            "💰 Add Balance",
+            "📦 My Orders"
+        ],
+        [
+            "👥 Refer",
+            "🎧 Support"
+        ],
     ]
 
     return ReplyKeyboardMarkup(
@@ -64,7 +81,9 @@ async def start(
 ):
 
     await update.message.reply_text(
-        "🏠 MAIN MENU",
+        "🏠 MAIN MENU\n\n"
+        "Welcome to the store!\n\n"
+        "Choose an option below.",
         reply_markup=main_menu_keyboard()
     )
 
@@ -80,42 +99,25 @@ async def my_profile(
 
     user = update.effective_user
 
-    # ------------------------------------------
     # Telegram Name
-    # ------------------------------------------
-
     telegram_name = user.full_name
 
-    # ------------------------------------------
     # Telegram Username
-    # ------------------------------------------
-
     if user.username:
         username = f"@{user.username}"
     else:
         username = "@N/A"
 
-    # ------------------------------------------
     # Telegram User ID
-    # ------------------------------------------
-
     user_id = user.id
 
-    # ------------------------------------------
-    # Current temporary values
-    #
-    # এগুলো এখন default value।
+    # Temporary values
     # পরবর্তীতে Database থেকে আসবে।
-    # ------------------------------------------
-
     balance = 0.00
     total_refs = 0
     ref_income = 0.00
 
-    # ------------------------------------------
     # Referral Link
-    # ------------------------------------------
-
     bot_username = context.bot.username
 
     if bot_username:
@@ -125,10 +127,7 @@ async def my_profile(
     else:
         referral_link = "Referral link unavailable"
 
-    # ------------------------------------------
     # Account Dashboard
-    # ------------------------------------------
-
     profile_text = (
         "👤 ACCOUNT DASHBOARD\n"
         "━━━━━━━━━━━━━━━━\n"
@@ -144,11 +143,14 @@ async def my_profile(
         f"🎁 Ref Income: ${ref_income:.2f}"
     )
 
-    await update.message.reply_text(profile_text)
+    await update.message.reply_text(
+        profile_text,
+        reply_markup=main_menu_keyboard()
+    )
 
 
 # ==========================================
-# BUY PRODUCTS MENU
+# BUY MORE PRODUCTS MENU
 # ==========================================
 
 async def buy_products(
@@ -169,28 +171,33 @@ async def buy_products(
         ],
         [
             InlineKeyboardButton(
-                "🌐 BUY Proxy {Coming soon}",
+                "🌐 BUY Proxy",
                 callback_data="buy_proxy"
             )
         ],
         [
             InlineKeyboardButton(
-                "🧑‍💻 Verification Service {coming soon}",
+                "🧑‍💻 Verification Service",
                 callback_data="verification_service"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 Main Menu",
+                callback_data="main_menu"
             )
         ]
     ]
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
     await update.message.reply_text(
-        "🛍️ Select a PRODUCT",
-        reply_markup=reply_markup
+        "🛍️ BUY MORE PRODUCTS\n\n"
+        "Select a PRODUCT:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
 # ==========================================
-# COMMUNICATION APPS MENU
+# COMMUNICATION APPS
 # ==========================================
 
 async def communication_apps(
@@ -234,20 +241,20 @@ async def communication_apps(
         ],
         [
             InlineKeyboardButton(
-                "🔙 Back",
-                callback_data="back_to_buy_products"
+                "🏠 Main Menu",
+                callback_data="main_menu"
             )
         ]
     ]
 
-    await query.message.reply_text(
+    await query.edit_message_text(
         "💬 COMMUNICATION APPS",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
 # ==========================================
-# GOOGLE VOICE MENU
+# GOOGLE VOICE
 # ==========================================
 
 async def google_voice(
@@ -277,14 +284,14 @@ async def google_voice(
         ]
     ]
 
-    await query.message.reply_text(
+    await query.edit_message_text(
         "📱 Google Voice",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
 # ==========================================
-# TEXTNOW MENU
+# TEXTNOW
 # ==========================================
 
 async def textnow(
@@ -314,14 +321,14 @@ async def textnow(
         ]
     ]
 
-    await query.message.reply_text(
+    await query.edit_message_text(
         "📱 TextNow",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
 # ==========================================
-# TEXTFREE MENU
+# TEXTFREE
 # ==========================================
 
 async def textfree(
@@ -351,14 +358,14 @@ async def textfree(
         ]
     ]
 
-    await query.message.reply_text(
+    await query.edit_message_text(
         "📱 TextFree",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
 # ==========================================
-# SIDELINE MENU
+# SIDELINE
 # ==========================================
 
 async def sideline(
@@ -388,7 +395,7 @@ async def sideline(
         ]
     ]
 
-    await query.message.reply_text(
+    await query.edit_message_text(
         "📱 Sideline",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -415,7 +422,7 @@ async def talkatone(
         ]
     ]
 
-    await query.message.reply_text(
+    await query.edit_message_text(
         "📱 Talkatone\n\n"
         "💰 Price: $ (Admin controlled)\n"
         "📦 Available from stock.",
@@ -444,7 +451,7 @@ async def textplus(
         ]
     ]
 
-    await query.message.reply_text(
+    await query.edit_message_text(
         "📱 TextPlus\n\n"
         "💰 Price: $ (Admin controlled)\n"
         "📦 Available from stock.",
@@ -453,50 +460,7 @@ async def textplus(
 
 
 # ==========================================
-# BACK TO BUY PRODUCTS
-# ==========================================
-
-async def back_to_buy_products(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-    await query.answer()
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "💬 Communication Apps",
-                callback_data="communication_apps"
-            ),
-            InlineKeyboardButton(
-                "🔐 BUY VPN",
-                callback_data="buy_vpn"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🌐 BUY Proxy {Coming soon}",
-                callback_data="buy_proxy"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🧑‍💻 Verification Service {coming soon}",
-                callback_data="verification_service"
-            )
-        ]
-    ]
-
-    await query.message.reply_text(
-        "🛍️ Select a PRODUCT",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# ==========================================
-# BUY VPN - VALIDITY MENU
+# BUY VPN
 # ==========================================
 
 async def buy_vpn(
@@ -530,13 +494,14 @@ async def buy_vpn(
         ],
         [
             InlineKeyboardButton(
-                "🔙 Back",
-                callback_data="back_to_buy_products"
+                "🏠 Main Menu",
+                callback_data="main_menu"
             )
         ]
     ]
 
-    await query.message.reply_text(
+    await query.edit_message_text(
+        "🔐 BUY VPN\n\n"
         "📅 Select Validity:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -583,7 +548,7 @@ async def vpn_03_days(
         ]
     ]
 
-    await query.message.reply_text(
+    await query.edit_message_text(
         "Select a VPN (3 Days):",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -654,7 +619,7 @@ async def vpn_07_days(
         ]
     ]
 
-    await query.message.reply_text(
+    await query.edit_message_text(
         "Select a VPN (7 Days):",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -725,7 +690,7 @@ async def vpn_07_page_2(
         ]
     ]
 
-    await query.message.reply_text(
+    await query.edit_message_text(
         "Select a VPN (7 Days):",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -758,7 +723,7 @@ async def vpn_07_page_3(
         ]
     ]
 
-    await query.message.reply_text(
+    await query.edit_message_text(
         "Select a VPN (7 Days):",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -791,7 +756,7 @@ async def vpn_14_days(
         ]
     ]
 
-    await query.message.reply_text(
+    await query.edit_message_text(
         "Select a VPN (14 Days):",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -868,7 +833,7 @@ async def vpn_30_days(
         ]
     ]
 
-    await query.message.reply_text(
+    await query.edit_message_text(
         "Select a VPN (30 Days):",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -889,14 +854,14 @@ async def buy_proxy(
     keyboard = [
         [
             InlineKeyboardButton(
-                "🔙 Back",
-                callback_data="back_to_buy_products"
+                "🏠 Main Menu",
+                callback_data="main_menu"
             )
         ]
     ]
 
-    await query.message.reply_text(
-        "🌐 BUY Proxy\n\n"
+    await query.edit_message_text(
+        "🌐 BUY PROXY\n\n"
         "🚧 Coming soon.",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -917,14 +882,14 @@ async def verification_service(
     keyboard = [
         [
             InlineKeyboardButton(
-                "🔙 Back",
-                callback_data="back_to_buy_products"
+                "🏠 Main Menu",
+                callback_data="main_menu"
             )
         ]
     ]
 
-    await query.message.reply_text(
-        "🧑‍💻 Verification Service\n\n"
+    await query.edit_message_text(
+        "🧑‍💻 VERIFICATION SERVICES\n\n"
         "🚧 Coming soon.",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -942,10 +907,18 @@ async def vpn_product_not_ready(
     query = update.callback_query
     await query.answer()
 
-    await query.message.reply_text(
+    await query.edit_message_text(
         "🚧 This VPN purchase system is not connected yet.\n\n"
         "💰 Price will be controlled from Admin Panel.\n"
-        "📦 Stock and automatic delivery will be connected later."
+        "📦 Stock and automatic delivery will be connected later.",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🔙 Back",
+                    callback_data="buy_vpn"
+                )
+            ]
+        ])
     )
 
 
@@ -961,10 +934,36 @@ async def product_not_ready(
     query = update.callback_query
     await query.answer()
 
-    await query.message.reply_text(
+    await query.edit_message_text(
         "🚧 This product purchase system is not connected yet.\n\n"
-        "It will be connected to stock, balance and automatic "
-        "delivery in the next step."
+        "💰 Price will be controlled from Admin Panel.\n"
+        "📦 Stock and automatic delivery will be connected later.",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🔙 Back",
+                    callback_data="communication_apps"
+                )
+            ]
+        ])
+    )
+
+
+# ==========================================
+# INLINE MAIN MENU
+# ==========================================
+
+async def back_to_main_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+    await query.answer()
+
+    await query.message.reply_text(
+        "🏠 MAIN MENU",
+        reply_markup=main_menu_keyboard()
     )
 
 
@@ -982,13 +981,216 @@ async def handle_message(
 
     text = update.message.text
 
-    # My Profile button
-    if text == "🧑‍💼 My Profile":
+    # ======================================
+    # COMMUNICATION APPS
+    # ======================================
+
+    if text == "📱 Communication Apps":
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "Google Voice",
+                    callback_data="google_voice"
+                ),
+                InlineKeyboardButton(
+                    "TextNow",
+                    callback_data="textnow"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "TextFree",
+                    callback_data="textfree"
+                ),
+                InlineKeyboardButton(
+                    "Sideline",
+                    callback_data="sideline"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Talkatone ($)",
+                    callback_data="talkatone"
+                ),
+                InlineKeyboardButton(
+                    "TextPlus ($)",
+                    callback_data="textplus"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🏠 Main Menu",
+                    callback_data="main_menu"
+                )
+            ]
+        ]
+
+        await update.message.reply_text(
+            "💬 COMMUNICATION APPS",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    # ======================================
+    # BUY VPN
+    # ======================================
+
+    elif text == "🔐 BUY VPN":
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "03 Days",
+                    callback_data="vpn_03_days"
+                ),
+                InlineKeyboardButton(
+                    "07 Days",
+                    callback_data="vpn_07_days"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "14 Days",
+                    callback_data="vpn_14_days"
+                ),
+                InlineKeyboardButton(
+                    "30 Days",
+                    callback_data="vpn_30_days"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🏠 Main Menu",
+                    callback_data="main_menu"
+                )
+            ]
+        ]
+
+        await update.message.reply_text(
+            "🔐 BUY VPN\n\n"
+            "📅 Select Validity:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    # ======================================
+    # VERIFICATION SERVICES
+    # ======================================
+
+    elif text == "🧑‍💻 Verification Services":
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "🏠 Main Menu",
+                    callback_data="main_menu"
+                )
+            ]
+        ]
+
+        await update.message.reply_text(
+            "🧑‍💻 VERIFICATION SERVICES\n\n"
+            "🚧 Coming soon.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    # ======================================
+    # BUY PROXY
+    # ======================================
+
+    elif text == "🌐 BUY Proxy":
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "🏠 Main Menu",
+                    callback_data="main_menu"
+                )
+            ]
+        ]
+
+        await update.message.reply_text(
+            "🌐 BUY PROXY\n\n"
+            "🚧 Coming soon.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    # ======================================
+    # MY PROFILE
+    # ======================================
+
+    elif text == "🧑‍💼 My Profile":
+
         await my_profile(update, context)
 
-    # Buy Products button
-    elif text == "🛍️ Buy Products":
+    # ======================================
+    # BUY MORE PRODUCTS
+    # ======================================
+
+    elif text == "🛍️ Buy More Products":
+
         await buy_products(update, context)
+
+    # ======================================
+    # ADD BALANCE
+    # ======================================
+
+    elif text == "💰 Add Balance":
+
+        await update.message.reply_text(
+            "💰 ADD BALANCE\n\n"
+            "🚧 Payment system is not connected yet."
+        )
+
+    # ======================================
+    # MY ORDERS
+    # ======================================
+
+    elif text == "📦 My Orders":
+
+        await update.message.reply_text(
+            "📦 MY ORDERS\n\n"
+            "🚧 Order system is not connected yet."
+        )
+
+    # ======================================
+    # REFER
+    # ======================================
+
+    elif text == "👥 Refer":
+
+        user = update.effective_user
+        bot_username = context.bot.username
+
+        if bot_username:
+            referral_link = (
+                f"https://t.me/{bot_username}?start=ref_{user.id}"
+            )
+        else:
+            referral_link = "Referral link unavailable"
+
+        await update.message.reply_text(
+            "👥 REFERRAL PROGRAM\n"
+            "━━━━━━━━━━━━━━━━\n\n"
+            f"🎯 Your Referral Link:\n"
+            f"{referral_link}\n\n"
+            f"💰 Commission: {REFERRAL_COMMISSION}%\n"
+            f"📌 Commission applies to the first "
+            f"{REFERRAL_DEPOSIT_LIMIT} deposits.\n\n"
+            "📊 Total Referrals: 0\n"
+            "🎁 Referral Income: $0.00"
+        )
+
+    # ======================================
+    # SUPPORT
+    # ======================================
+
+    elif text == "🎧 Support":
+
+        await update.message.reply_text(
+            "🎧 SUPPORT\n\n"
+            "For support, please contact:\n"
+            "@JanKug"
+        )
 
 
 # ==========================================
@@ -997,23 +1199,32 @@ async def handle_message(
 
 def main():
 
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN is missing. "
+            "Please add BOT_TOKEN in Railway Variables."
+        )
+
     application = (
         Application.builder()
         .token(BOT_TOKEN)
         .build()
     )
 
-    # ------------------------------------------
-    # /start command
-    # ------------------------------------------
+    # ======================================
+    # /START
+    # ======================================
 
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
-    # ------------------------------------------
-    # Keyboard message handler
-    # ------------------------------------------
+    # ======================================
+    # MESSAGE HANDLER
+    # ======================================
 
     application.add_handler(
         MessageHandler(
@@ -1022,9 +1233,20 @@ def main():
         )
     )
 
-    # ==========================================
-    # COMMUNICATION APP HANDLERS
-    # ==========================================
+    # ======================================
+    # MAIN MENU CALLBACK
+    # ======================================
+
+    application.add_handler(
+        CallbackQueryHandler(
+            back_to_main_menu,
+            pattern="^main_menu$"
+        )
+    )
+
+    # ======================================
+    # COMMUNICATION APPS
+    # ======================================
 
     application.add_handler(
         CallbackQueryHandler(
@@ -1075,20 +1297,9 @@ def main():
         )
     )
 
-    # ==========================================
-    # BUY PRODUCTS BACK
-    # ==========================================
-
-    application.add_handler(
-        CallbackQueryHandler(
-            back_to_buy_products,
-            pattern="^back_to_buy_products$"
-        )
-    )
-
-    # ==========================================
-    # VPN HANDLERS
-    # ==========================================
+    # ======================================
+    # BUY VPN
+    # ======================================
 
     application.add_handler(
         CallbackQueryHandler(
@@ -1139,9 +1350,9 @@ def main():
         )
     )
 
-    # ==========================================
-    # PROXY
-    # ==========================================
+    # ======================================
+    # BUY PROXY
+    # ======================================
 
     application.add_handler(
         CallbackQueryHandler(
@@ -1150,9 +1361,9 @@ def main():
         )
     )
 
-    # ==========================================
+    # ======================================
     # VERIFICATION SERVICE
-    # ==========================================
+    # ======================================
 
     application.add_handler(
         CallbackQueryHandler(
@@ -1161,9 +1372,9 @@ def main():
         )
     )
 
-    # ==========================================
-    # VPN PRODUCT BUTTONS
-    # ==========================================
+    # ======================================
+    # VPN PRODUCTS
+    # ======================================
 
     application.add_handler(
         CallbackQueryHandler(
@@ -1172,9 +1383,9 @@ def main():
         )
     )
 
-    # ==========================================
-    # COMMUNICATION PRODUCT BUTTONS
-    # ==========================================
+    # ======================================
+    # COMMUNICATION PRODUCTS
+    # ======================================
 
     application.add_handler(
         CallbackQueryHandler(
