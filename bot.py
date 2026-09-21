@@ -116,11 +116,16 @@ async def communication_apps(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await q.edit_message_text("💬 COMMUNICATION APPS\n━━━━━━━━━━━━━━━━\n\nSelect a product:",reply_markup=InlineKeyboardMarkup(kb))
 
 
-def simple_two_product_screen(title, pairs, back="communication_apps"):
+def simple_two_product_screen(title, products, back="communication_apps"):
+    # products is a flat list of (button_text, callback_data) pairs.
+    # Keep the two products on one row.
     kb=[]
-    for a,b in pairs:
-        kb.append([InlineKeyboardButton(a[0],callback_data=a[1]),InlineKeyboardButton(b[0],callback_data=b[1])])
-    kb.append([InlineKeyboardButton("🔙 Back",callback_data=back)])
+    for i in range(0, len(products), 2):
+        row=[]
+        for label, callback in products[i:i+2]:
+            row.append(InlineKeyboardButton(label, callback_data=callback))
+        kb.append(row)
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data=back)])
     return InlineKeyboardMarkup(kb)
 
 
