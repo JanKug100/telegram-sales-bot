@@ -12,6 +12,9 @@ from db import (
     get_product_by_key, get_available_stock_count, create_purchase_intent,
     complete_purchase, create_payment, get_payment, submit_payment_reference,
     confirm_payment, cancel_payment, get_recent_orders, get_order_items,
+    admin_dashboard_stats, admin_list_products, admin_get_product,
+    admin_create_product, admin_update_product, admin_delete_product,
+    admin_list_categories, admin_log,
 )
 
 BOT_USERNAME = None
@@ -29,14 +32,17 @@ def ensure_user(update: Update):
     return get_user(user.id)
 
 
-def main_menu_keyboard():
-    return InlineKeyboardMarkup([
+def main_menu_keyboard(user_id=None):
+    rows = [
         [InlineKeyboardButton("📱 Communication Apps", callback_data="communication_apps"), InlineKeyboardButton("🔐 BUY VPN", callback_data="buy_vpn")],
         [InlineKeyboardButton("🧑‍💻 Verification Services", callback_data="verification_service"), InlineKeyboardButton("🌐 BUY Proxy", callback_data="buy_proxy")],
         [InlineKeyboardButton("🧑‍💼 My Profile", callback_data="my_profile"), InlineKeyboardButton("🛍️ Buy More Products", callback_data="buy_more_products")],
         [InlineKeyboardButton("💰 Add Balance", callback_data="add_balance"), InlineKeyboardButton("📦 My Orders", callback_data="my_orders")],
         [InlineKeyboardButton("👥 Refer", callback_data="refer"), InlineKeyboardButton("🎧 Support", callback_data="support")],
-    ])
+    ]
+    if user_id in ADMIN_IDS:
+        rows.append([InlineKeyboardButton("🔐 Admin Panel", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(rows)
 
 
 def back_main_keyboard():
@@ -498,6 +504,342 @@ async def cancel_payment_cmd(update,context):
         await update.message.reply_text("✅ Payment cancelled.")
     except Exception as e: await update.message.reply_text(f"❌ {e}")
 
+
+# =========================
+# STAGE 5A — ADMIN PANEL
+# Dashboard + Product Management
+# =========================
+
+def admin_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Dashboard", callback_data="admin_dashboard")],
+        [InlineKeyboardButton("🛍️ Products", callback_data="admin_products")],
+        [InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")],
+    ])
+
+
+async def admin_command(update, context):
+    if not await admin_only(update):
+        return
+    await update.message.reply_text(
+        "🔐 ADMIN PANEL\n━━━━━━━━━━━━━━━━\n\nChoose an option:",
+        reply_markup=admin_kb()
+    )
+
+
+async def admin_dashboard(update, context):
+    q = update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True)
+        return
+    await q.answer()
+    s = admin_dashboard_stats()
+    text = (
+        "📊 ADMIN DASHBOARD\n"
+        "━━━━━━━━━━━━━━━━\n\n"
+        f"👥 Total Users: {s['total_users']}\n"
+        f"📦 Total Products: {s['total_products']}\n"
+        f"📊 Available Stock: {s['available_stock']}\n\n"
+        f"💰 Total Sales: ${s['total_sales']:.2f}\n"
+        f"💵 Last 24 Hours: ${s['sales_24h']:.2f}\n"
+        f"💵 Last 7 Days: ${s['sales_7d']:.2f}\n"
+        f"💵 Last 1 Month: ${s['sales_30d']:.2f}\n"
+    )
+    await q.edit_message_text(text, reply_markup=admin_kb())
+
+
+def admin_products_kb(products, page=0, per_page=8):
+    start = page * per_page
+    current = products[start:start + per_page]
+    rows = []
+    for p in current:
+        status = "🟢" if int(p["is_active"]) else "🔴"
+        rows.append([InlineKeyboardButton(
+            f"{status} {p['name']} — ${float(p['price']):.2f}",
+            callback_data=f"admin_product:{p['id']}"
+        )])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"admin_products_page:{page-1}"))
+    if start + per_page < len(products):
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"admin_products_page:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("➕ Add Product", callback_data="admin_add_product")])
+    rows.append([InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def admin_products(update, context, page=0):
+    q = update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True)
+        return
+    await q.answer()
+    products = admin_list_products()
+    if not products:
+        text = "🛍️ PRODUCTS\n━━━━━━━━━━━━━━━━\n\nNo products found."
+    else:
+        text = f"🛍️ PRODUCTS\n━━━━━━━━━━━━━━━━\n\nTotal products: {len(products)}\nSelect a product:"
+    await q.edit_message_text(text, reply_markup=admin_products_kb(products, page))
+
+
+async def admin_products_callback(update, context):
+    await admin_products(update, context, 0)
+
+
+async def admin_products_page(update, context):
+    q = update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True)
+        return
+    try:
+        page = int(q.data.split(":", 1)[1])
+    except Exception:
+        page = 0
+    await admin_products(update, context, page)
+
+
+async def admin_product_detail(update, context):
+    q = update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True)
+        return
+    product_id = int(q.data.split(":", 1)[1])
+    p = admin_get_product(product_id)
+    if not p:
+        await q.answer("Product not found.", show_alert=True)
+        return
+    await q.answer()
+    stock = int(p["available_stock"])
+    sold = int(p["sold_stock"])
+    status = "🟢 Active" if int(p["is_active"]) else "🔴 Inactive"
+    category = p["category_name"] or "Uncategorized"
+    text = (
+        "🛍️ PRODUCT DETAILS\n"
+        "━━━━━━━━━━━━━━━━\n\n"
+        f"ID: {p['id']}\n"
+        f"Name: {p['name']}\n"
+        f"Key: {p['product_key']}\n"
+        f"Category: {category}\n"
+        f"Price: ${float(p['price']):.2f}\n"
+        f"Status: {status}\n"
+        f"📦 Available Stock: {stock}\n"
+        f"📤 Sold Stock: {sold}\n"
+    )
+    toggle = "🔴 Deactivate" if int(p["is_active"]) else "🟢 Activate"
+    kb = [
+        [InlineKeyboardButton("💵 Change Price", callback_data=f"admin_price:{product_id}")],
+        [InlineKeyboardButton(toggle, callback_data=f"admin_toggle:{product_id}")],
+        [InlineKeyboardButton("✏️ Edit Name", callback_data=f"admin_name:{product_id}")],
+        [InlineKeyboardButton("🗑️ Remove Product", callback_data=f"admin_delete:{product_id}")],
+        [InlineKeyboardButton("🔙 Products", callback_data="admin_products")],
+    ]
+    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def admin_prompt(update, context, kind, product_id, prompt):
+    q = update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True)
+        return
+    if not admin_get_product(product_id):
+        await q.answer("Product not found.", show_alert=True)
+        return
+    context.user_data["admin_input"] = {"kind": kind, "product_id": product_id}
+    await q.answer()
+    await q.edit_message_text(
+        prompt,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"admin_product:{product_id}")]
+        ])
+    )
+
+
+async def admin_change_price(update, context):
+    product_id = int(update.callback_query.data.split(":", 1)[1])
+    await admin_prompt(
+        update, context, "price", product_id,
+        "💵 CHANGE PRICE\n━━━━━━━━━━━━━━━━\n\n"
+        "Send the new USD price.\n\nExample: 3.50"
+    )
+
+
+async def admin_change_name(update, context):
+    product_id = int(update.callback_query.data.split(":", 1)[1])
+    await admin_prompt(
+        update, context, "name", product_id,
+        "✏️ CHANGE PRODUCT NAME\n━━━━━━━━━━━━━━━━\n\n"
+        "Send the new product name."
+    )
+
+
+async def admin_toggle_product(update, context):
+    q = update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True)
+        return
+    product_id = int(q.data.split(":", 1)[1])
+    p = admin_get_product(product_id)
+    if not p:
+        await q.answer("Product not found.", show_alert=True)
+        return
+    new_status = 0 if int(p["is_active"]) else 1
+    admin_update_product(product_id, is_active=new_status)
+    admin_log(update.effective_user.id, "toggle_product", "product", product_id, f"is_active={new_status}")
+    await q.answer("Product status updated.")
+    await admin_product_detail(update, context)
+
+
+async def admin_delete_product_prompt(update, context):
+    q = update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True)
+        return
+    product_id = int(q.data.split(":", 1)[1])
+    p = admin_get_product(product_id)
+    if not p:
+        await q.answer("Product not found.", show_alert=True)
+        return
+    await q.answer()
+    await q.edit_message_text(
+        f"⚠️ REMOVE PRODUCT\n━━━━━━━━━━━━━━━━\n\n"
+        f"Product: {p['name']}\n\n"
+        "This action will remove the product if it has no stock or order history.\n"
+        "If it has existing data, it will be safely deactivated instead.\n\n"
+        "Are you sure?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, Remove", callback_data=f"admin_delete_confirm:{product_id}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"admin_product:{product_id}")]
+        ])
+    )
+
+
+async def admin_delete_product_confirm(update, context):
+    q = update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True)
+        return
+    product_id = int(q.data.split(":", 1)[1])
+    result = admin_delete_product(product_id)
+    admin_log(update.effective_user.id, "remove_product", "product", product_id, result)
+    await q.answer(result, show_alert=True)
+    await admin_products(update, context)
+
+
+async def admin_add_product_prompt(update, context):
+    q = update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True)
+        return
+    cats = admin_list_categories()
+    cat_lines = "\n".join([f"{c['id']} = {c['name']}" for c in cats])
+    context.user_data["admin_input"] = {"kind": "add_product"}
+    await q.answer()
+    await q.edit_message_text(
+        "➕ ADD PRODUCT\n━━━━━━━━━━━━━━━━\n\n"
+        "Send the product details in ONE message using:\n\n"
+        "category_id | product_key | product_name | price\n\n"
+        "Example:\n"
+        "1 | gv_new2 | Google Voice New 2 | 3.50\n\n"
+        "Available categories:\n" + cat_lines +
+        "\n\nProduct will be created as Active.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data="admin_products")]
+        ])
+    )
+
+
+async def admin_input_handler(update, context) -> bool:
+    state = context.user_data.get("admin_input")
+    if not state or not update.message or not update.message.text:
+        return False
+    if not await admin_only(update):
+        context.user_data.pop("admin_input", None)
+        return False
+
+    raw = update.message.text.strip()
+    kind = state.get("kind")
+
+    try:
+        if kind == "price":
+            price = float(raw)
+            if price < 0:
+                raise ValueError("Price cannot be negative.")
+            pid = int(state["product_id"])
+            admin_update_product(pid, price=round(price, 2))
+            admin_log(update.effective_user.id, "change_price", "product", pid, f"price={price:.2f}")
+            context.user_data.pop("admin_input", None)
+            await update.message.reply_text(
+                f"✅ Product price updated to ${price:.2f}.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🛍️ Products", callback_data="admin_products")],
+                    [InlineKeyboardButton("🔐 Admin Panel", callback_data="admin_panel")]
+                ])
+            )
+            return True
+
+        if kind == "name":
+            if len(raw) < 1 or len(raw) > 100:
+                raise ValueError("Name must be 1-100 characters.")
+            pid = int(state["product_id"])
+            admin_update_product(pid, name=raw)
+            admin_log(update.effective_user.id, "change_name", "product", pid, raw)
+            context.user_data.pop("admin_input", None)
+            await update.message.reply_text(
+                "✅ Product name updated.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🛍️ Products", callback_data="admin_products")],
+                    [InlineKeyboardButton("🔐 Admin Panel", callback_data="admin_panel")]
+                ])
+            )
+            return True
+
+        if kind == "add_product":
+            parts = [x.strip() for x in raw.split("|")]
+            if len(parts) != 4:
+                raise ValueError("Use exactly: category_id | product_key | product_name | price")
+            category_id = int(parts[0])
+            key = parts[1]
+            name = parts[2]
+            price = float(parts[3])
+            if not key or not name or price < 0:
+                raise ValueError("Invalid product data.")
+            product_id = admin_create_product(category_id, key, name, price)
+            admin_log(update.effective_user.id, "add_product", "product", product_id, f"{key} / {name}")
+            context.user_data.pop("admin_input", None)
+            await update.message.reply_text(
+                f"✅ Product added successfully.\n\n"
+                f"Product ID: {product_id}\n"
+                f"Name: {name}\n"
+                f"Price: ${price:.2f}\n\n"
+                "It is Active and currently has 0 stock.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🛍️ Products", callback_data="admin_products")],
+                    [InlineKeyboardButton("🔐 Admin Panel", callback_data="admin_panel")]
+                ])
+            )
+            return True
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ {e}\n\nPlease try again or press Cancel.")
+        return True
+
+    return False
+
+
+
+async def admin_command_callback(update, context):
+    q = update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True)
+        return
+    await q.answer()
+    await q.edit_message_text(
+        "🔐 ADMIN PANEL\n━━━━━━━━━━━━━━━━\n\nChoose an option:",
+        reply_markup=admin_kb()
+    )
+
 async def error_handler(update,context): print("Bot error:",context.error)
 
 
@@ -510,6 +852,19 @@ def main():
     application.add_handler(CommandHandler("pending_payments",pending_payments))
     application.add_handler(CommandHandler("approve_payment",approve_payment_cmd))
     application.add_handler(CommandHandler("cancel_payment",cancel_payment_cmd))
+    application.add_handler(CommandHandler("admin",admin_command))
+
+    application.add_handler(CallbackQueryHandler(admin_command_callback,pattern="^admin_panel$"))
+    application.add_handler(CallbackQueryHandler(admin_dashboard,pattern="^admin_dashboard$"))
+    application.add_handler(CallbackQueryHandler(admin_products_callback,pattern="^admin_products$"))
+    application.add_handler(CallbackQueryHandler(admin_products_page,pattern="^admin_products_page:"))
+    application.add_handler(CallbackQueryHandler(admin_product_detail,pattern="^admin_product:"))
+    application.add_handler(CallbackQueryHandler(admin_change_price,pattern="^admin_price:"))
+    application.add_handler(CallbackQueryHandler(admin_change_name,pattern="^admin_name:"))
+    application.add_handler(CallbackQueryHandler(admin_toggle_product,pattern="^admin_toggle:"))
+    application.add_handler(CallbackQueryHandler(admin_delete_product_prompt,pattern="^admin_delete:"))
+    application.add_handler(CallbackQueryHandler(admin_delete_product_confirm,pattern="^admin_delete_confirm:"))
+    application.add_handler(CallbackQueryHandler(admin_add_product_prompt,pattern="^admin_add_product$"))
 
     application.add_handler(CallbackQueryHandler(show_main_menu,pattern="^main_menu$"))
     application.add_handler(CallbackQueryHandler(show_profile,pattern="^my_profile$"))
@@ -547,13 +902,14 @@ def main():
 
     # Text handler first checks active payment/amount states.
     async def text_router(update,context):
+        if await admin_input_handler(update,context): return
         if await process_custom_quantity(update,context): return
         if await add_balance_text_handler(update,context): return
         await text_message_handler(update,context)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_router))
     application.add_error_handler(error_handler)
 
-    print(f"{STORE_NAME} Stage 3 bot is running...")
+    print(f"{STORE_NAME} Stage 5A bot is running...")
     application.run_polling()
 
 if __name__ == "__main__": main()
