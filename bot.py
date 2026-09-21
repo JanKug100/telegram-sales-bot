@@ -4,6 +4,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 
 from telegram.ext import (
@@ -173,6 +174,18 @@ async def start(
         return
 
     # --------------------------------------------------------
+    # IMPORTANT:
+    # Remove any old Telegram Reply Keyboard
+    # --------------------------------------------------------
+
+    if update.message:
+
+        await update.message.reply_text(
+            "🔄 Updating store menu...",
+            reply_markup=ReplyKeyboardRemove()
+        )
+
+    # --------------------------------------------------------
     # Referral information
     # --------------------------------------------------------
 
@@ -195,7 +208,7 @@ async def start(
                 referred_by = int(referral_id)
 
     # --------------------------------------------------------
-    # Create/update user
+    # Create / update user
     # --------------------------------------------------------
 
     existing_user = get_user(user.id)
@@ -220,7 +233,7 @@ async def start(
         )
 
     # --------------------------------------------------------
-    # Welcome
+    # Welcome message
     # --------------------------------------------------------
 
     await update.message.reply_text(
@@ -686,7 +699,7 @@ async def textplus(
 
 
 # ============================================================
-# COMMUNICATION PRODUCT PLACEHOLDER
+# COMMUNICATION PRODUCT
 # ============================================================
 
 async def communication_product(
@@ -1176,7 +1189,7 @@ async def vpn_30_days(
 
 
 # ============================================================
-# VPN PRODUCT PLACEHOLDER
+# VPN PRODUCT
 # ============================================================
 
 async def vpn_product(
@@ -1532,10 +1545,19 @@ async def handle_unknown_message(
     if not update.message:
         return
 
+    # --------------------------------------------------------
+    # Remove old Reply Keyboard if it still exists
+    # --------------------------------------------------------
+
     await update.message.reply_text(
-
         "🏠 Please use the buttons below.",
+        reply_markup=ReplyKeyboardRemove()
+    )
 
+    await update.message.reply_text(
+        f"🏠 {STORE_NAME}\n"
+        "━━━━━━━━━━━━━━━━\n\n"
+        "Choose an option below.",
         reply_markup=main_menu_keyboard()
     )
 
@@ -1691,9 +1713,7 @@ def main():
     application.add_handler(
         CallbackQueryHandler(
             communication_product,
-            pattern=(
-                "^product_"
-            )
+            pattern="^product_"
         )
     )
 
