@@ -1,4 +1,4 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
 
 from config import (
@@ -52,9 +52,15 @@ def product_key_from_callback(data: str) -> str:
 
 
 def product_purchase_keyboard(product_key: str, stock_count: int):
+    # Preset quantities are convenient, while Custom Quantity lets the
+    # customer enter any positive whole number up to the available stock.
     rows = [
-        [InlineKeyboardButton("1", callback_data=f"buyqty:{product_key}:1"), InlineKeyboardButton("2", callback_data=f"buyqty:{product_key}:2"), InlineKeyboardButton("3", callback_data=f"buyqty:{product_key}:3")],
-        [InlineKeyboardButton("5", callback_data=f"buyqty:{product_key}:5"), InlineKeyboardButton("10", callback_data=f"buyqty:{product_key}:10")],
+        [InlineKeyboardButton("1", callback_data=f"buyqty:{product_key}:1"),
+         InlineKeyboardButton("2", callback_data=f"buyqty:{product_key}:2"),
+         InlineKeyboardButton("3", callback_data=f"buyqty:{product_key}:3")],
+        [InlineKeyboardButton("5", callback_data=f"buyqty:{product_key}:5"),
+         InlineKeyboardButton("10", callback_data=f"buyqty:{product_key}:10")],
+        [InlineKeyboardButton("✏️ Custom Quantity", callback_data=f"customqty:{product_key}")],
         [InlineKeyboardButton("🔙 Back", callback_data="communication_apps" if product_key in {"gv_old","gv_new","tn_web","tn_phone","tf_web","tf_phone","sl_web","sl_phone","talkatone","textplus"} else "buy_vpn")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -73,8 +79,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not update.message:
         return
-    await update.message.reply_text("🔄 Updating store menu...", reply_markup=ReplyKeyboardRemove())
-
     referred_by = None
     if context.args and context.args[0].startswith("ref_"):
         raw = context.args[0][4:]
@@ -162,6 +166,112 @@ async def talkatone(update, context): await show_product_for_purchase(update,con
 async def textplus(update, context): await show_product_for_purchase(update,context,"textplus")
 async def communication_product(update, context): await show_product_for_purchase(update,context,product_key_from_callback(update.callback_query.data))
 async def vpn_product(update, context): await show_product_for_purchase(update,context,product_key_from_callback(update.callback_query.data))
+
+
+async def custom_quantity_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    product_key = q.data.split(":", 1)[1]
+    product = get_product_by_key(product_key)
+    if not product or not int(product["is_active"]):
+        await q.answer("This product is unavailable.", show_alert=True)
+        return
+
+    stock = get_available_stock_count(product["id"])
+    if stock < 1:
+        await q.answer("Out of stock.", show_alert=True)
+        return
+
+    # Store only the current customer's pending custom-quantity request.
+    context.user_data["awaiting_custom_quantity"] = product_key
+    await q.answer()
+    await q.edit_message_text(
+        f"✏️ CUSTOM QUANTITY\n━━━━━━━━━━━━━━━━\n\n"
+        f"Product: {product['name']}\n"
+        f"Price: ${float(product['price']):.2f} each\n"
+        f"Available stock: {stock}\n\n"
+        f"Please type the quantity you want to buy.\n"
+        f"Example: 25\n\n"
+        f"Enter a whole number from 1 to {stock}.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancelcustomqty:{product_key}")]])
+    )
+
+
+async def cancel_custom_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    product_key = q.data.split(":", 1)[1]
+    context.user_data.pop("awaiting_custom_quantity", None)
+    await q.answer("Cancelled.")
+    await show_product_for_purchase(update, context, product_key)
+
+
+async def process_custom_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    product_key = context.user_data.get("awaiting_custom_quantity")
+    if not product_key or not update.message or not update.message.text:
+        return False
+
+    raw = update.message.text.strip()
+    if not raw.isdigit():
+        await update.message.reply_text(
+            "❌ Invalid quantity.\n\nPlease enter a whole number only, for example: 25.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancelcustomqty:{product_key}")]])
+        )
+        return True
+
+    quantity = int(raw)
+    if quantity < 1:
+        await update.message.reply_text("❌ Quantity must be at least 1.")
+        return True
+
+    product = get_product_by_key(product_key)
+    if not product or not int(product["is_active"]):
+        context.user_data.pop("awaiting_custom_quantity", None)
+        await update.message.reply_text("❌ This product is no longer available.", reply_markup=main_menu_keyboard())
+        return True
+
+    stock = get_available_stock_count(product["id"])
+    if quantity > stock:
+        await update.message.reply_text(
+            f"❌ Not enough stock.\n\nAvailable: {stock}\nYou requested: {quantity}\n\nPlease enter a quantity from 1 to {stock}.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancelcustomqty:{product_key}")]])
+        )
+        return True
+
+    context.user_data.pop("awaiting_custom_quantity", None)
+    total = round(float(product["price"]) * quantity, 2)
+    balance = get_balance(update.effective_user.id)
+
+    if balance + 1e-9 >= total:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"✅ Buy {quantity} for ${total:.2f}", callback_data=f"confirmbuy:{product_key}:{quantity}")],
+            [InlineKeyboardButton("🔙 Back", callback_data=f"product_{product_key}")]
+        ])
+        await update.message.reply_text(
+            f"🛒 ORDER SUMMARY\n━━━━━━━━━━━━━━━━\n\n"
+            f"Product: {product['name']}\n"
+            f"Quantity: {quantity}\n"
+            f"Unit price: ${float(product['price']):.2f}\n"
+            f"Total: ${total:.2f}\n\n"
+            f"💳 Your balance: ${balance:.2f}\n\n"
+            f"Your balance is sufficient.",
+            reply_markup=kb
+        )
+    else:
+        required = round(total - balance, 2)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"💰 Pay ${required:.2f} & Continue", callback_data=f"paypurchase:{product_key}:{quantity}")],
+            [InlineKeyboardButton("🔙 Back", callback_data=f"product_{product_key}")]
+        ])
+        await update.message.reply_text(
+            f"🛒 ORDER SUMMARY\n━━━━━━━━━━━━━━━━\n\n"
+            f"Product: {product['name']}\n"
+            f"Quantity: {quantity}\n"
+            f"Total: ${total:.2f}\n\n"
+            f"💳 Current balance: ${balance:.2f}\n"
+            f"❗ Additional payment required: ${required:.2f}\n\n"
+            f"After payment is confirmed, the purchase will continue automatically.",
+            reply_markup=kb
+        )
+    return True
 
 
 async def quantity_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -262,7 +372,6 @@ async def text_message_handler(update, context):
                 except Exception: pass
         except Exception as e: await update.message.reply_text(f"❌ {e}")
         return
-    await update.message.reply_text("🏠 Please use the buttons below.",reply_markup=ReplyKeyboardRemove())
     await update.message.reply_text(f"🏠 {STORE_NAME}\n━━━━━━━━━━━━━━━━\n\nChoose an option below.",reply_markup=main_menu_keyboard())
 
 
@@ -411,6 +520,8 @@ def main():
     application.add_handler(CallbackQueryHandler(sideline,pattern="^sideline$"))
     application.add_handler(CallbackQueryHandler(talkatone,pattern="^talkatone$"))
     application.add_handler(CallbackQueryHandler(textplus,pattern="^textplus$"))
+    application.add_handler(CallbackQueryHandler(custom_quantity_prompt,pattern="^customqty:"))
+    application.add_handler(CallbackQueryHandler(cancel_custom_quantity,pattern="^cancelcustomqty:"))
     application.add_handler(CallbackQueryHandler(quantity_selected,pattern="^buyqty:"))
     application.add_handler(CallbackQueryHandler(confirm_buy,pattern="^confirmbuy:"))
     application.add_handler(CallbackQueryHandler(pay_purchase,pattern="^paypurchase:"))
@@ -436,6 +547,7 @@ def main():
 
     # Text handler first checks active payment/amount states.
     async def text_router(update,context):
+        if await process_custom_quantity(update,context): return
         if await add_balance_text_handler(update,context): return
         await text_message_handler(update,context)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_router))
