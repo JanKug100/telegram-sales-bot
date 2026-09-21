@@ -161,24 +161,22 @@ async def buy_products(
     keyboard = [
         [
             InlineKeyboardButton(
-                "💬 Communication Apps",
-                callback_data="communication_apps"
+                "📧 Email Accounts",
+                callback_data="email_accounts"
             ),
             InlineKeyboardButton(
-                "🔐 BUY VPN",
-                callback_data="buy_vpn"
+                "⭐ Premium Apps",
+                callback_data="premium_apps"
             )
         ],
         [
             InlineKeyboardButton(
-                "🌐 BUY Proxy",
-                callback_data="buy_proxy"
-            )
-        ],
-        [
+                "💻 Software & Tools",
+                callback_data="software_tools"
+            ),
             InlineKeyboardButton(
-                "🧑‍💻 Verification Service",
-                callback_data="verification_service"
+                "🎮 Gaming Products",
+                callback_data="gaming_products"
             )
         ],
         [
@@ -190,8 +188,170 @@ async def buy_products(
     ]
 
     await update.message.reply_text(
-        "🛍️ BUY MORE PRODUCTS\n\n"
-        "Select a PRODUCT:",
+        "🛍️ BUY MORE PRODUCTS\n"
+        "━━━━━━━━━━━━━━━━\n\n"
+        "Select a product category:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+# ==========================================
+# EMAIL ACCOUNTS
+# ==========================================
+
+async def email_accounts(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🔙 Back",
+                callback_data="buy_more_products"
+            )
+        ]
+    ]
+
+    await query.edit_message_text(
+        "📧 EMAIL ACCOUNTS\n\n"
+        "🚧 Products will be available soon.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+# ==========================================
+# PREMIUM APPS
+# ==========================================
+
+async def premium_apps(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🔙 Back",
+                callback_data="buy_more_products"
+            )
+        ]
+    ]
+
+    await query.edit_message_text(
+        "⭐ PREMIUM APPS\n\n"
+        "🚧 Products will be available soon.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+# ==========================================
+# SOFTWARE & TOOLS
+# ==========================================
+
+async def software_tools(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🔙 Back",
+                callback_data="buy_more_products"
+            )
+        ]
+    ]
+
+    await query.edit_message_text(
+        "💻 SOFTWARE & TOOLS\n\n"
+        "🚧 Products will be available soon.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+# ==========================================
+# GAMING PRODUCTS
+# ==========================================
+
+async def gaming_products(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🔙 Back",
+                callback_data="buy_more_products"
+            )
+        ]
+    ]
+
+    await query.edit_message_text(
+        "🎮 GAMING PRODUCTS\n\n"
+        "🚧 Products will be available soon.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+# ==========================================
+# BACK TO BUY MORE PRODUCTS
+# ==========================================
+
+async def back_to_buy_more_products(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "📧 Email Accounts",
+                callback_data="email_accounts"
+            ),
+            InlineKeyboardButton(
+                "⭐ Premium Apps",
+                callback_data="premium_apps"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "💻 Software & Tools",
+                callback_data="software_tools"
+            ),
+            InlineKeyboardButton(
+                "🎮 Gaming Products",
+                callback_data="gaming_products"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 Main Menu",
+                callback_data="main_menu"
+            )
+        ]
+    ]
+
+    await query.edit_message_text(
+        "🛍️ BUY MORE PRODUCTS\n"
+        "━━━━━━━━━━━━━━━━\n\n"
+        "Select a product category:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -1294,6 +1454,45 @@ def main():
         CallbackQueryHandler(
             textplus,
             pattern="^textplus$"
+        )
+    )
+
+    # ======================================
+    # BUY MORE PRODUCTS
+    # ======================================
+
+    application.add_handler(
+        CallbackQueryHandler(
+            back_to_buy_more_products,
+            pattern="^buy_more_products$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            email_accounts,
+            pattern="^email_accounts$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            premium_apps,
+            pattern="^premium_apps$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            software_tools,
+            pattern="^software_tools$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            gaming_products,
+            pattern="^gaming_products$"
         )
     )
 
