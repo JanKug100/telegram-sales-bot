@@ -1,1909 +1,442 @@
-import os
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardRemove,
-)
-
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
 
 from config import (
-    BOT_TOKEN,
-    SUPPORT_USERNAME,
-    STORE_NAME,
-    DEFAULT_REFERRAL_COMMISSION,
-    DEFAULT_REFERRAL_DEPOSIT_LIMIT,
+    BOT_TOKEN, SUPPORT_USERNAME, STORE_NAME,
+    DEFAULT_REFERRAL_COMMISSION, DEFAULT_REFERRAL_DEPOSIT_LIMIT,
+    ADMIN_IDS,
 )
 
 from db import (
-    init_db,
-    get_user,
-    create_user,
-    update_user,
-    get_balance,
-    get_setting,
-    database_health_check,
+    init_db, get_user, create_user, update_user, get_balance, get_setting,
+    get_product_by_key, get_available_stock_count, create_purchase_intent,
+    complete_purchase, create_payment, get_payment, submit_payment_reference,
+    confirm_payment, cancel_payment, get_recent_orders, get_order_items,
 )
-
-
-# ============================================================
-# BOT INFORMATION
-# ============================================================
 
 BOT_USERNAME = None
 
 
-# ============================================================
-# DATABASE / USER HELPERS
-# ============================================================
-
 def ensure_user(update: Update):
-
     user = update.effective_user
-
     if not user:
         return None
-
-    existing_user = get_user(user.id)
-
-    if not existing_user:
-
-        create_user(
-            telegram_id=user.id,
-            username=user.username,
-            first_name=user.first_name,
-            last_name=user.last_name,
-        )
-
+    existing = get_user(user.id)
+    if not existing:
+        create_user(user.id, user.username, user.first_name, user.last_name)
     else:
-
-        update_user(
-            telegram_id=user.id,
-            username=user.username,
-            first_name=user.first_name,
-            last_name=user.last_name,
-        )
-
+        update_user(user.id, user.username, user.first_name, user.last_name)
     return get_user(user.id)
 
 
-# ============================================================
-# MAIN MENU
-# ============================================================
-
 def main_menu_keyboard():
-
-    keyboard = [
-
-        [
-            InlineKeyboardButton(
-                "📱 Communication Apps",
-                callback_data="communication_apps"
-            ),
-            InlineKeyboardButton(
-                "🔐 BUY VPN",
-                callback_data="buy_vpn"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🧑‍💻 Verification Services",
-                callback_data="verification_service"
-            ),
-            InlineKeyboardButton(
-                "🌐 BUY Proxy",
-                callback_data="buy_proxy"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🧑‍💼 My Profile",
-                callback_data="my_profile"
-            ),
-            InlineKeyboardButton(
-                "🛍️ Buy More Products",
-                callback_data="buy_more_products"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "💰 Add Balance",
-                callback_data="add_balance"
-            ),
-            InlineKeyboardButton(
-                "📦 My Orders",
-                callback_data="my_orders"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "👥 Refer",
-                callback_data="refer"
-            ),
-            InlineKeyboardButton(
-                "🎧 Support",
-                callback_data="support"
-            ),
-        ],
-    ]
-
-    return InlineKeyboardMarkup(keyboard)
-
-
-# ============================================================
-# SIMPLE BACK BUTTON
-# ============================================================
-
-def back_main_keyboard():
-
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🏠 Main Menu",
-                callback_data="main_menu"
-            )
-        ]
+        [InlineKeyboardButton("📱 Communication Apps", callback_data="communication_apps"), InlineKeyboardButton("🔐 BUY VPN", callback_data="buy_vpn")],
+        [InlineKeyboardButton("🧑‍💻 Verification Services", callback_data="verification_service"), InlineKeyboardButton("🌐 BUY Proxy", callback_data="buy_proxy")],
+        [InlineKeyboardButton("🧑‍💼 My Profile", callback_data="my_profile"), InlineKeyboardButton("🛍️ Buy More Products", callback_data="buy_more_products")],
+        [InlineKeyboardButton("💰 Add Balance", callback_data="add_balance"), InlineKeyboardButton("📦 My Orders", callback_data="my_orders")],
+        [InlineKeyboardButton("👥 Refer", callback_data="refer"), InlineKeyboardButton("🎧 Support", callback_data="support")],
     ])
 
 
-# ============================================================
-# START
-# ============================================================
+def back_main_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
 
+def product_key_from_callback(data: str) -> str:
+    if data.startswith("product_"):
+        return data[len("product_"):]
+    if data.startswith("vpn_product_"):
+        return data[len("vpn_product_"):]
+    return data
+
+
+def product_purchase_keyboard(product_key: str, stock_count: int):
+    rows = [
+        [InlineKeyboardButton("1", callback_data=f"buyqty:{product_key}:1"), InlineKeyboardButton("2", callback_data=f"buyqty:{product_key}:2"), InlineKeyboardButton("3", callback_data=f"buyqty:{product_key}:3")],
+        [InlineKeyboardButton("5", callback_data=f"buyqty:{product_key}:5"), InlineKeyboardButton("10", callback_data=f"buyqty:{product_key}:10")],
+        [InlineKeyboardButton("🔙 Back", callback_data="communication_apps" if product_key in {"gv_old","gv_new","tn_web","tn_phone","tf_web","tf_phone","sl_web","sl_phone","talkatone","textplus"} else "buy_vpn")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def format_delivery(contents):
+    if not contents:
+        return "No delivery content was found. Please contact support."
+    lines = ["📦 DELIVERY", "━━━━━━━━━━━━━━━━"]
+    for i, content in enumerate(contents, 1):
+        lines.append(f"\n#{i}\n{content}")
+    return "\n".join(lines)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-
-    if not user:
+    if not user or not update.message:
         return
-
-    # --------------------------------------------------------
-    # IMPORTANT:
-    # Remove any old Telegram Reply Keyboard
-    # --------------------------------------------------------
-
-    if update.message:
-
-        await update.message.reply_text(
-            "🔄 Updating store menu...",
-            reply_markup=ReplyKeyboardRemove()
-        )
-
-    # --------------------------------------------------------
-    # Referral information
-    # --------------------------------------------------------
+    await update.message.reply_text("🔄 Updating store menu...", reply_markup=ReplyKeyboardRemove())
 
     referred_by = None
+    if context.args and context.args[0].startswith("ref_"):
+        raw = context.args[0][4:]
+        if raw.isdigit():
+            ref_user = get_user(int(raw))
+            if ref_user and ref_user["telegram_id"] != user.id:
+                referred_by = ref_user["id"]
 
-    if context.args:
-
-        referral_argument = context.args[0]
-
-        if referral_argument.startswith("ref_"):
-
-            referral_id = referral_argument.replace(
-                "ref_",
-                "",
-                1
-            )
-
-            if referral_id.isdigit():
-
-                referred_by = int(referral_id)
-
-    # --------------------------------------------------------
-    # Create / update user
-    # --------------------------------------------------------
-
-    existing_user = get_user(user.id)
-
-    if not existing_user:
-
-        create_user(
-            telegram_id=user.id,
-            username=user.username,
-            first_name=user.first_name,
-            last_name=user.last_name,
-            referred_by=referred_by,
-        )
-
+    existing = get_user(user.id)
+    if not existing:
+        create_user(user.id, user.username, user.first_name, user.last_name, referred_by)
     else:
-
-        update_user(
-            telegram_id=user.id,
-            username=user.username,
-            first_name=user.first_name,
-            last_name=user.last_name,
-        )
-
-    # --------------------------------------------------------
-    # Welcome message
-    # --------------------------------------------------------
+        update_user(user.id, user.username, user.first_name, user.last_name)
 
     await update.message.reply_text(
-
-        f"🏠 {STORE_NAME}\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "Welcome to the store!\n\n"
-        "Choose an option below.",
-
+        f"🏠 {STORE_NAME}\n━━━━━━━━━━━━━━━━\n\nWelcome to the store!\n\nChoose an option below.",
         reply_markup=main_menu_keyboard()
     )
 
 
-# ============================================================
-# SHOW MAIN MENU
-# ============================================================
-
-async def show_main_menu(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    await query.edit_message_text(
-
-        f"🏠 {STORE_NAME}\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "Choose an option below.",
-
-        reply_markup=main_menu_keyboard()
-    )
-
-
-# ============================================================
-# MY PROFILE
-# ============================================================
-
-async def show_profile(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    user = update.effective_user
-
-    ensure_user(update)
-
-    balance = get_balance(user.id)
-
-    if user.username:
-
-        username = f"@{user.username}"
-
-    else:
-
-        username = "@N/A"
-
-    bot_username = context.bot.username
-
-    if bot_username:
-
-        referral_link = (
-            f"https://t.me/{bot_username}"
-            f"?start=ref_{user.id}"
-        )
-
-    else:
-
-        referral_link = "Referral link unavailable"
-
-    db_user = get_user(user.id)
-
-    total_refs = 0
-    ref_income = 0.0
-
-    if db_user:
-
-        total_refs = db_user["total_referrals"]
-
-        ref_income = db_user["referral_income"]
-
-    commission = get_setting(
-        "referral_commission",
-        str(DEFAULT_REFERRAL_COMMISSION)
-    )
-
-    deposit_limit = get_setting(
-        "referral_deposit_limit",
-        str(DEFAULT_REFERRAL_DEPOSIT_LIMIT)
-    )
-
-    profile_text = (
-
-        "👤 ACCOUNT DASHBOARD\n"
-        "━━━━━━━━━━━━━━━━\n"
-
-        f"🏷 Name: {user.full_name}\n"
-
-        f"🔰 Username: {username}\n"
-
-        f"🆔 User ID: {user.id}\n"
-
-        "━━━━━━━━━━━━━━━━\n"
-
-        f"💳 Balance: ${balance:.2f}\n"
-
-        f"🎯 Referral Link:\n"
-        f"{referral_link}\n\n"
-
-        f"💰 Refer {commission}% commission\n"
-        f"📌 First {deposit_limit} deposits\n\n"
-
-        f"📊 Total Refs: {total_refs}\n"
-
-        f"🎁 Ref Income: ${ref_income:.2f}"
-    )
-
-    keyboard = [
-
-        [
-            InlineKeyboardButton(
-                "🔗 Refer",
-                callback_data="refer"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🏠 Main Menu",
-                callback_data="main_menu"
-            )
-        ]
-
-    ]
-
-    await query.edit_message_text(
-        profile_text,
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# ============================================================
-# COMMUNICATION APPS
-# ============================================================
-
-async def communication_apps(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    keyboard = [
-
-        [
-            InlineKeyboardButton(
-                "Google Voice",
-                callback_data="google_voice"
-            ),
-            InlineKeyboardButton(
-                "TextNow",
-                callback_data="textnow"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "TextFree",
-                callback_data="textfree"
-            ),
-            InlineKeyboardButton(
-                "Sideline",
-                callback_data="sideline"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "Talkatone",
-                callback_data="talkatone"
-            ),
-            InlineKeyboardButton(
-                "TextPlus",
-                callback_data="textplus"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🏠 Main Menu",
-                callback_data="main_menu"
-            )
-        ],
-
-    ]
-
-    await query.edit_message_text(
-
-        "💬 COMMUNICATION APPS\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "Select a product:",
-
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# ============================================================
-# GOOGLE VOICE
-# ============================================================
-
-async def google_voice(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    keyboard = [
-
-        [
-            InlineKeyboardButton(
-                "Old GV",
-                callback_data="product_old_gv"
-            ),
-            InlineKeyboardButton(
-                "New GV",
-                callback_data="product_new_gv"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🔙 Back",
-                callback_data="communication_apps"
-            )
-        ],
-
-    ]
-
-    await query.edit_message_text(
-
-        "📱 GOOGLE VOICE\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "Choose product:",
-
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# ============================================================
-# TEXTNOW
-# ============================================================
-
-async def textnow(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    keyboard = [
-
-        [
-            InlineKeyboardButton(
-                "Web TN",
-                callback_data="product_web_tn"
-            ),
-            InlineKeyboardButton(
-                "Phone TN",
-                callback_data="product_phone_tn"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🔙 Back",
-                callback_data="communication_apps"
-            )
-        ],
-
-    ]
-
-    await query.edit_message_text(
-
-        "📱 TEXTNOW\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "Choose product:",
-
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# ============================================================
-# TEXTFREE
-# ============================================================
-
-async def textfree(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    keyboard = [
-
-        [
-            InlineKeyboardButton(
-                "Web TF",
-                callback_data="product_web_tf"
-            ),
-            InlineKeyboardButton(
-                "Phone TF",
-                callback_data="product_phone_tf"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🔙 Back",
-                callback_data="communication_apps"
-            )
-        ],
-
-    ]
-
-    await query.edit_message_text(
-
-        "📱 TEXTFREE\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "Choose product:",
-
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# ============================================================
-# SIDELINE
-# ============================================================
-
-async def sideline(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    keyboard = [
-
-        [
-            InlineKeyboardButton(
-                "Web SL",
-                callback_data="product_web_sl"
-            ),
-            InlineKeyboardButton(
-                "Phone SL",
-                callback_data="product_phone_sl"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🔙 Back",
-                callback_data="communication_apps"
-            )
-        ],
-
-    ]
-
-    await query.edit_message_text(
-
-        "📱 SIDELINE\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "Choose product:",
-
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# ============================================================
-# TALKATONE
-# ============================================================
-
-async def talkatone(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    await query.edit_message_text(
-
-        "📱 TALKATONE\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "💰 Price: Admin controlled\n"
-        "📦 Stock: Database controlled\n\n"
-        "🚧 Purchase system will be connected "
-        "in the next development stage.",
-
-        reply_markup=InlineKeyboardMarkup([
-
-            [
-                InlineKeyboardButton(
-                    "🔙 Back",
-                    callback_data="communication_apps"
-                )
-            ],
-
-        ])
-    )
-
-
-# ============================================================
-# TEXTPLUS
-# ============================================================
-
-async def textplus(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    await query.edit_message_text(
-
-        "📱 TEXTPLUS\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "💰 Price: Admin controlled\n"
-        "📦 Stock: Database controlled\n\n"
-        "🚧 Purchase system will be connected "
-        "in the next development stage.",
-
-        reply_markup=InlineKeyboardMarkup([
-
-            [
-                InlineKeyboardButton(
-                    "🔙 Back",
-                    callback_data="communication_apps"
-                )
-            ],
-
-        ])
-    )
-
-
-# ============================================================
-# COMMUNICATION PRODUCT
-# ============================================================
-
-async def communication_product(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    product_key = query.data.replace(
-        "product_",
-        "",
-        1
-    )
-
-    await query.edit_message_text(
-
-        f"🛍️ PRODUCT\n"
-        f"━━━━━━━━━━━━━━━━\n\n"
-        f"Product: {product_key}\n\n"
-        "💰 Price: Will be controlled "
-        "from Database/Admin Panel.\n"
-        "📦 Stock: Will be controlled "
-        "from Database.\n\n"
-        "🚧 Purchase system is the next stage.",
-
-        reply_markup=InlineKeyboardMarkup([
-
-            [
-                InlineKeyboardButton(
-                    "🔙 Back",
-                    callback_data="communication_apps"
-                )
-            ],
-
-        ])
-    )
-
-
-# ============================================================
-# BUY VPN
-# ============================================================
-
-async def buy_vpn(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    keyboard = [
-
-        [
-            InlineKeyboardButton(
-                "03 Days",
-                callback_data="vpn_03_days"
-            ),
-            InlineKeyboardButton(
-                "07 Days",
-                callback_data="vpn_07_days"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "14 Days",
-                callback_data="vpn_14_days"
-            ),
-            InlineKeyboardButton(
-                "30 Days",
-                callback_data="vpn_30_days"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🏠 Main Menu",
-                callback_data="main_menu"
-            )
-        ],
-
-    ]
-
-    await query.edit_message_text(
-
-        "🔐 BUY VPN\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "📅 Select validity:",
-
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# ============================================================
-# VPN 03 DAYS
-# ============================================================
-
-async def vpn_03_days(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    keyboard = [
-
-        [
-            InlineKeyboardButton(
-                "Express VPN",
-                callback_data="vpn_product_express_3"
-            ),
-            InlineKeyboardButton(
-                "CyberGhost VPN",
-                callback_data="vpn_product_cyberghost_3"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "Vypr VPN",
-                callback_data="vpn_product_vypr_3"
-            ),
-            InlineKeyboardButton(
-                "Panda VPN",
-                callback_data="vpn_product_panda_3"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🔙 Back",
-                callback_data="buy_vpn"
-            )
-        ],
-
-    ]
-
-    await query.edit_message_text(
-
-        "🔐 VPN — 03 DAYS\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "Select a VPN:",
-
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# ============================================================
-# VPN 07 DAYS PAGE 1
-# ============================================================
-
-async def vpn_07_days(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    keyboard = [
-
-        [
-            InlineKeyboardButton(
-                "Express VPN",
-                callback_data="vpn_product_express_7"
-            ),
-            InlineKeyboardButton(
-                "Nord VPN",
-                callback_data="vpn_product_nord_7"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "PIA VPN",
-                callback_data="vpn_product_pia_7"
-            ),
-            InlineKeyboardButton(
-                "IPVanish VPN",
-                callback_data="vpn_product_ipvanish_7"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "Surfshark VPN",
-                callback_data="vpn_product_surfshark_7"
-            ),
-            InlineKeyboardButton(
-                "HotspotShield VPN",
-                callback_data="vpn_product_hotspotshield_7"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "HMA VPN",
-                callback_data="vpn_product_hma_7"
-            ),
-            InlineKeyboardButton(
-                "Pure VPN",
-                callback_data="vpn_product_pure_7"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🔙 Back",
-                callback_data="buy_vpn"
-            ),
-            InlineKeyboardButton(
-                "Next ➡️",
-                callback_data="vpn_07_page_2"
-            ),
-        ],
-
-    ]
-
-    await query.edit_message_text(
-
-        "🔐 VPN — 07 DAYS\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "Page 1",
-
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# ============================================================
-# VPN 07 DAYS PAGE 2
-# ============================================================
-
-async def vpn_07_page_2(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    keyboard = [
-
-        [
-            InlineKeyboardButton(
-                "Turbo VPN",
-                callback_data="vpn_product_turbo_7"
-            ),
-            InlineKeyboardButton(
-                "Avast VPN",
-                callback_data="vpn_product_avast_7"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "AdGuard VPN",
-                callback_data="vpn_product_adguard_7"
-            ),
-            InlineKeyboardButton(
-                "Norton VPN",
-                callback_data="vpn_product_norton_7"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "AVG VPN",
-                callback_data="vpn_product_avg_7"
-            ),
-            InlineKeyboardButton(
-                "X-VPN",
-                callback_data="vpn_product_x_7"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "Sky VPN",
-                callback_data="vpn_product_sky_7"
-            ),
-            InlineKeyboardButton(
-                "Potato VPN",
-                callback_data="vpn_product_potato_7"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🔙 Back",
-                callback_data="vpn_07_days"
-            ),
-            InlineKeyboardButton(
-                "Next ➡️",
-                callback_data="vpn_07_page_3"
-            ),
-        ],
-
-    ]
-
-    await query.edit_message_text(
-
-        "🔐 VPN — 07 DAYS\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "Page 2",
-
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# ============================================================
-# VPN 07 DAYS PAGE 3
-# ============================================================
-
-async def vpn_07_page_3(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    keyboard = [
-
-        [
-            InlineKeyboardButton(
-                "Bitdefender VPN",
-                callback_data="vpn_product_bitdefender_7"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🔙 Back",
-                callback_data="vpn_07_page_2"
-            )
-        ],
-
-    ]
-
-    await query.edit_message_text(
-
-        "🔐 VPN — 07 DAYS\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "Page 3",
-
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# ============================================================
-# VPN 14 DAYS
-# ============================================================
-
-async def vpn_14_days(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    keyboard = [
-
-        [
-            InlineKeyboardButton(
-                "Octohide",
-                callback_data="vpn_product_octohide_14"
-            )
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🔙 Back",
-                callback_data="buy_vpn"
-            )
-        ],
-
-    ]
-
-    await query.edit_message_text(
-
-        "🔐 VPN — 14 DAYS\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "Select a VPN:",
-
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# ============================================================
-# VPN 30 DAYS
-# ============================================================
-
-async def vpn_30_days(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    keyboard = [
-
-        [
-            InlineKeyboardButton(
-                "Express VPN (1 Device)",
-                callback_data="vpn_product_express_30"
-            ),
-            InlineKeyboardButton(
-                "Nord VPN",
-                callback_data="vpn_product_nord_30"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "PIA VPN (1 Device)",
-                callback_data="vpn_product_pia_30"
-            ),
-            InlineKeyboardButton(
-                "Avast VPN",
-                callback_data="vpn_product_avast_30"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "Bitdefender VPN",
-                callback_data="vpn_product_bitdefender_30"
-            ),
-            InlineKeyboardButton(
-                "HMA VPN",
-                callback_data="vpn_product_hma_30"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "Mysterium VPN",
-                callback_data="vpn_product_mysterium_30"
-            ),
-            InlineKeyboardButton(
-                "MYSTERIUM DARK",
-                callback_data="vpn_product_mysterium_dark_30"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "Windscribe VPN",
-                callback_data="vpn_product_windscribe_30"
-            ),
-            InlineKeyboardButton(
-                "Proton VPN",
-                callback_data="vpn_product_proton_30"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🔙 Back",
-                callback_data="buy_vpn"
-            )
-        ],
-
-    ]
-
-    await query.edit_message_text(
-
-        "🔐 VPN — 30 DAYS\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "Select a VPN:",
-
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# ============================================================
-# VPN PRODUCT
-# ============================================================
-
-async def vpn_product(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    product_key = query.data.replace(
-        "vpn_product_",
-        "",
-        1
-    )
-
-    await query.edit_message_text(
-
-        "🔐 VPN PRODUCT\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-
-        f"Product: {product_key}\n\n"
-
-        "💰 Price: Database controlled\n"
-        "📦 Stock: Database controlled\n\n"
-
-        "🚧 Purchase and automatic delivery "
-        "will be connected in the next stage.",
-
-        reply_markup=InlineKeyboardMarkup([
-
-            [
-                InlineKeyboardButton(
-                    "🔙 Back",
-                    callback_data="buy_vpn"
-                )
-            ]
-
-        ])
-    )
-
-
-# ============================================================
-# BUY PROXY
-# ============================================================
-
-async def buy_proxy(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    await query.edit_message_text(
-
-        "🌐 BUY PROXY\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "🚧 Coming soon.",
-
-        reply_markup=back_main_keyboard()
-    )
-
-
-# ============================================================
-# VERIFICATION SERVICES
-# ============================================================
-
-async def verification_service(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    await query.edit_message_text(
-
-        "🧑‍💻 VERIFICATION SERVICES\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "🚧 Coming soon.",
-
-        reply_markup=back_main_keyboard()
-    )
-
-
-# ============================================================
-# BUY MORE PRODUCTS
-# ============================================================
-
-async def buy_more_products(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    keyboard = [
-
-        [
-            InlineKeyboardButton(
-                "📧 Email Accounts",
-                callback_data="email_accounts"
-            ),
-            InlineKeyboardButton(
-                "⭐ Premium Apps",
-                callback_data="premium_apps"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "💻 Software & Tools",
-                callback_data="software_tools"
-            ),
-            InlineKeyboardButton(
-                "🎮 Gaming Products",
-                callback_data="gaming_products"
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🏠 Main Menu",
-                callback_data="main_menu"
-            )
-        ],
-
-    ]
-
-    await query.edit_message_text(
-
-        "🛍️ BUY MORE PRODUCTS\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "Select a category:",
-
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# ============================================================
-# COMING SOON CATEGORY
-# ============================================================
-
-async def coming_soon_category(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    await query.edit_message_text(
-
-        "🚧 COMING SOON\n\n"
-        "This category will be available soon.",
-
-        reply_markup=InlineKeyboardMarkup([
-
-            [
-                InlineKeyboardButton(
-                    "🔙 Back",
-                    callback_data="buy_more_products"
-                )
-            ]
-
-        ])
-    )
-
-
-# ============================================================
-# ADD BALANCE
-# ============================================================
-
-async def add_balance(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    await query.edit_message_text(
-
-        "💰 ADD BALANCE\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-
-        "Payment system is not connected yet.\n\n"
-
-        "💳 Payment methods will be added "
-        "after the purchase and balance "
-        "system is completed.",
-
-        reply_markup=back_main_keyboard()
-    )
-
-
-# ============================================================
-# MY ORDERS
-# ============================================================
-
-async def my_orders(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    await query.edit_message_text(
-
-        "📦 MY ORDERS\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-
-        "You don't have any orders yet.\n\n"
-
-        "Order history will be connected "
-        "to the database in the next stage.",
-
-        reply_markup=back_main_keyboard()
-    )
-
-
-# ============================================================
-# REFER
-# ============================================================
-
-async def refer(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    user = update.effective_user
-
-    ensure_user(update)
-
-    bot_username = context.bot.username
-
-    if bot_username:
-
-        referral_link = (
-            f"https://t.me/{bot_username}"
-            f"?start=ref_{user.id}"
-        )
-
-    else:
-
-        referral_link = "Referral link unavailable"
-
-    db_user = get_user(user.id)
-
-    total_refs = 0
-    ref_income = 0.0
-
-    if db_user:
-
-        total_refs = db_user["total_referrals"]
-
-        ref_income = db_user["referral_income"]
-
-    commission = get_setting(
-        "referral_commission",
-        str(DEFAULT_REFERRAL_COMMISSION)
-    )
-
-    deposit_limit = get_setting(
-        "referral_deposit_limit",
-        str(DEFAULT_REFERRAL_DEPOSIT_LIMIT)
-    )
-
-    text = (
-
-        "👥 REFERRAL PROGRAM\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-
-        "🎯 Your Referral Link:\n"
-        f"{referral_link}\n\n"
-
-        f"💰 Commission: {commission}%\n"
-
-        f"📌 Commission applies to the first "
-        f"{deposit_limit} deposits.\n\n"
-
-        f"📊 Total Referrals: {total_refs}\n"
-
-        f"🎁 Referral Income: ${ref_income:.2f}"
-    )
-
-    await query.edit_message_text(
-
-        text,
-
-        reply_markup=InlineKeyboardMarkup([
-
-            [
-                InlineKeyboardButton(
-                    "🏠 Main Menu",
-                    callback_data="main_menu"
-                )
-            ]
-
-        ])
-    )
-
-
-# ============================================================
-# SUPPORT
-# ============================================================
-
-async def support(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    await query.edit_message_text(
-
-        "🎧 SUPPORT\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-
-        "For support, please contact:\n"
-
-        f"{SUPPORT_USERNAME}",
-
-        reply_markup=back_main_keyboard()
-    )
-
-
-# ============================================================
-# UNKNOWN TEXT
-# ============================================================
-
-async def handle_unknown_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not update.message:
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    await q.edit_message_text(f"🏠 {STORE_NAME}\n━━━━━━━━━━━━━━━━\n\nChoose an option below.", reply_markup=main_menu_keyboard())
+
+
+async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer(); user=update.effective_user; ensure_user(update)
+    balance=get_balance(user.id); username=f"@{user.username}" if user.username else "@N/A"
+    referral_link=f"https://t.me/{context.bot.username}?start=ref_{user.id}" if context.bot.username else "Referral link unavailable"
+    db_user=get_user(user.id); total_refs=int(db_user["total_referrals"]) if db_user else 0; ref_income=float(db_user["referral_income"]) if db_user else 0
+    commission=get_setting("referral_commission", str(DEFAULT_REFERRAL_COMMISSION)); limit=get_setting("referral_deposit_limit", str(DEFAULT_REFERRAL_DEPOSIT_LIMIT))
+    text=(f"👤 ACCOUNT DASHBOARD\n━━━━━━━━━━━━━━━━\n🏷 Name: {user.full_name}\n🔰 Username: {username}\n🆔 User ID: {user.id}\n━━━━━━━━━━━━━━━━\n💳 Balance: ${balance:.2f}\n🎯 Referral Link:\n{referral_link}\n\n💰 Refer {commission}% commission\n📌 First {limit} deposits\n\n📊 Total Refs: {total_refs}\n🎁 Ref Income: ${ref_income:.2f}")
+    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Refer", callback_data="refer")],[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]))
+
+
+async def communication_apps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    kb=[[InlineKeyboardButton("Google Voice",callback_data="google_voice"),InlineKeyboardButton("TextNow",callback_data="textnow")],[InlineKeyboardButton("TextFree",callback_data="textfree"),InlineKeyboardButton("Sideline",callback_data="sideline")],[InlineKeyboardButton("Talkatone",callback_data="talkatone"),InlineKeyboardButton("TextPlus",callback_data="textplus")],[InlineKeyboardButton("🏠 Main Menu",callback_data="main_menu")]]
+    await q.edit_message_text("💬 COMMUNICATION APPS\n━━━━━━━━━━━━━━━━\n\nSelect a product:",reply_markup=InlineKeyboardMarkup(kb))
+
+
+def simple_two_product_screen(title, pairs, back="communication_apps"):
+    kb=[]
+    for a,b in pairs:
+        kb.append([InlineKeyboardButton(a[0],callback_data=a[1]),InlineKeyboardButton(b[0],callback_data=b[1])])
+    kb.append([InlineKeyboardButton("🔙 Back",callback_data=back)])
+    return InlineKeyboardMarkup(kb)
+
+
+async def google_voice(update, context):
+    q=update.callback_query; await q.answer(); await q.edit_message_text("📱 GOOGLE VOICE\n━━━━━━━━━━━━━━━━\n\nChoose product:",reply_markup=simple_two_product_screen("",[("Old GV","product_gv_old"),("New GV","product_gv_new")]))
+
+async def textnow(update, context):
+    q=update.callback_query; await q.answer(); await q.edit_message_text("📱 TEXTNOW\n━━━━━━━━━━━━━━━━\n\nChoose product:",reply_markup=simple_two_product_screen("",[("Web TN","product_tn_web"),("Phone TN","product_tn_phone")]))
+
+async def textfree(update, context):
+    q=update.callback_query; await q.answer(); await q.edit_message_text("📱 TEXTFREE\n━━━━━━━━━━━━━━━━\n\nChoose product:",reply_markup=simple_two_product_screen("",[("Web TF","product_tf_web"),("Phone TF","product_tf_phone")]))
+
+async def sideline(update, context):
+    q=update.callback_query; await q.answer(); await q.edit_message_text("📱 SIDELINE\n━━━━━━━━━━━━━━━━\n\nChoose product:",reply_markup=simple_two_product_screen("",[("Web SL","product_sl_web"),("Phone SL","product_sl_phone")]))
+
+
+async def show_product_for_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE, product_key: str):
+    q=update.callback_query
+    product=get_product_by_key(product_key)
+    if not product:
+        await q.answer("Product is not configured.", show_alert=True); return
+    if not int(product["is_active"]):
+        await q.answer("This product is currently unavailable.", show_alert=True); return
+    stock=get_available_stock_count(product["id"])
+    if stock < 1:
+        await q.answer("Out of stock.", show_alert=True)
+        await q.edit_message_text(f"🛍️ {product['name']}\n━━━━━━━━━━━━━━━━\n\n❌ Out of stock.\n\nPlease contact {SUPPORT_USERNAME} to ask about stock.", reply_markup=product_purchase_keyboard(product_key,0))
         return
-
-    # --------------------------------------------------------
-    # Remove old Reply Keyboard if it still exists
-    # --------------------------------------------------------
-
-    await update.message.reply_text(
-        "🏠 Please use the buttons below.",
-        reply_markup=ReplyKeyboardRemove()
-    )
-
-    await update.message.reply_text(
-        f"🏠 {STORE_NAME}\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "Choose an option below.",
-        reply_markup=main_menu_keyboard()
-    )
+    await q.answer()
+    await q.edit_message_text(f"🛍️ {product['name']}\n━━━━━━━━━━━━━━━━\n\n💰 Price: ${float(product['price']):.2f}\n📦 Available: {stock}\n\nSelect quantity:", reply_markup=product_purchase_keyboard(product_key,stock))
 
 
-# ============================================================
-# ERROR HANDLER
-# ============================================================
-
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    print(
-        "Bot error:",
-        context.error
-    )
+async def talkatone(update, context): await show_product_for_purchase(update,context,"talkatone")
+async def textplus(update, context): await show_product_for_purchase(update,context,"textplus")
+async def communication_product(update, context): await show_product_for_purchase(update,context,product_key_from_callback(update.callback_query.data))
+async def vpn_product(update, context): await show_product_for_purchase(update,context,product_key_from_callback(update.callback_query.data))
 
 
-# ============================================================
-# MAIN
-# ============================================================
+async def quantity_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query
+    try:
+        _, product_key, qty_raw=q.data.split(":",2); quantity=int(qty_raw)
+    except Exception:
+        await q.answer("Invalid quantity.",show_alert=True); return
+    product=get_product_by_key(product_key)
+    if not product: await q.answer("Product not found.",show_alert=True); return
+    stock=get_available_stock_count(product["id"])
+    if stock < quantity:
+        await q.answer(f"Only {stock} in stock.",show_alert=True); return
+    total=round(float(product["price"])*quantity,2); balance=get_balance(update.effective_user.id)
+    if balance+1e-9 >= total:
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ Buy {quantity} for ${total:.2f}",callback_data=f"confirmbuy:{product_key}:{quantity}")],[InlineKeyboardButton("🔙 Back",callback_data=f"product_{product_key}")]])
+        await q.answer(); await q.edit_message_text(f"🛒 ORDER SUMMARY\n━━━━━━━━━━━━━━━━\n\nProduct: {product['name']}\nQuantity: {quantity}\nUnit price: ${float(product['price']):.2f}\nTotal: ${total:.2f}\n\n💳 Your balance: ${balance:.2f}\n\nYour balance is sufficient.",reply_markup=kb)
+    else:
+        required=round(total-balance,2)
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton(f"💰 Pay ${required:.2f} & Continue",callback_data=f"paypurchase:{product_key}:{quantity}")],[InlineKeyboardButton("🔙 Back",callback_data=f"product_{product_key}")]])
+        await q.answer(); await q.edit_message_text(f"🛒 ORDER SUMMARY\n━━━━━━━━━━━━━━━━\n\nProduct: {product['name']}\nQuantity: {quantity}\nTotal: ${total:.2f}\n\n💳 Current balance: ${balance:.2f}\n❗ Additional payment required: ${required:.2f}\n\nAfter payment is confirmed, the purchase will continue automatically.",reply_markup=kb)
+
+
+async def confirm_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query
+    try: _,product_key,qty_raw=q.data.split(":",2); quantity=int(qty_raw)
+    except Exception: await q.answer("Invalid order.",show_alert=True); return
+    product=get_product_by_key(product_key)
+    if not product: await q.answer("Product not found.",show_alert=True); return
+    total=round(float(product["price"])*quantity,2); balance=get_balance(update.effective_user.id)
+    if balance+1e-9<total: await q.answer("Your balance is no longer sufficient.",show_alert=True); return
+    try:
+        intent=create_purchase_intent(update.effective_user.id,product["id"],quantity,0)
+        result=complete_purchase(intent)
+        await q.answer("Purchase completed!")
+        await q.edit_message_text(f"✅ PURCHASE COMPLETE\n━━━━━━━━━━━━━━━━\n\nOrder #{result['order_id']}\nProduct: {result['product_name']}\nQuantity: {result['quantity']}\nTotal: ${result['total']:.2f}\n\n💳 Remaining balance: ${result['balance_after']:.2f}\n\n{format_delivery(result['delivered'])}",reply_markup=back_main_keyboard())
+    except Exception as e:
+        await q.answer(str(e),show_alert=True)
+
+
+async def pay_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query
+    try: _,product_key,qty_raw=q.data.split(":",2); quantity=int(qty_raw)
+    except Exception: await q.answer("Invalid order.",show_alert=True); return
+    product=get_product_by_key(product_key)
+    if not product: await q.answer("Product not found.",show_alert=True); return
+    total=round(float(product["price"])*quantity,2); balance=get_balance(update.effective_user.id); required=max(0,round(total-balance,2))
+    if required<=0: await q.answer("No payment is needed now.",show_alert=True); return
+    stock=get_available_stock_count(product["id"])
+    if stock<quantity: await q.answer("Stock is no longer sufficient.",show_alert=True); return
+    intent=create_purchase_intent(update.effective_user.id,product["id"],quantity,required)
+    payment_id=create_payment(update.effective_user.id,required,"binance_pay",intent,"USD")
+    pay_id=get_setting("binance_pay_id","Not configured yet")
+    context.user_data["awaiting_payment_tx"] = payment_id
+    kb=InlineKeyboardMarkup([[InlineKeyboardButton("✍️ Enter Binance Order ID",callback_data=f"enterpay:{payment_id}")],[InlineKeyboardButton("❌ Cancel",callback_data=f"cancel_user_payment:{payment_id}")]])
+    await q.answer(); await q.edit_message_text(f"💳 PAYMENT REQUIRED\n━━━━━━━━━━━━━━━━\n\nProduct: {product['name']}\nQuantity: {quantity}\nPurchase total: ${total:.2f}\nCurrent balance: ${balance:.2f}\nPayment required: ${required:.2f}\n\n🔶 Method: Binance Pay\n🆔 Payment Request: #{payment_id}\n💳 Binance Pay ID: {pay_id}\n\nSend the payment through Binance Pay, then submit your Binance Order ID.\n\nAfter admin confirmation, your balance will be credited and this purchase will be completed automatically.",reply_markup=kb)
+    for admin_id in ADMIN_IDS:
+        try: await context.bot.send_message(admin_id,f"🔔 NEW PURCHASE PAYMENT\nPayment #{payment_id}\nUser: {update.effective_user.id}\nProduct: {product['name']} x{quantity}\nRequired: ${required:.2f}\n\nUser must submit Binance Order ID before approval.")
+        except Exception: pass
+
+
+async def enter_payment(update, context):
+    q=update.callback_query
+    payment_id=int(q.data.split(":",1)[1]); payment=get_payment(payment_id)
+    if not payment or payment["telegram_id"]!=update.effective_user.id or payment["status"]!="pending": await q.answer("Payment is not available.",show_alert=True); return
+    context.user_data["awaiting_payment_tx"]=payment_id
+    await q.answer(); await q.edit_message_text(f"✍️ PAYMENT #{payment_id}\n\nPlease send your Binance Order ID as a text message.\n\nExample: 1234567890",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data=f"cancel_user_payment:{payment_id}")]]))
+
+
+async def cancel_user_payment(update, context):
+    q=update.callback_query; payment_id=int(q.data.split(":",1)[1]); payment=get_payment(payment_id)
+    if not payment or payment["telegram_id"]!=update.effective_user.id: await q.answer("Invalid payment.",show_alert=True); return
+    # User cancellation is handled directly as pending -> cancelled.
+    from db import cancel_payment as db_cancel_payment
+    try:
+        db_cancel_payment(payment_id, update.effective_user.id, "Cancelled by customer")
+        context.user_data.pop("awaiting_payment_tx",None)
+        await q.answer("Payment cancelled."); await q.edit_message_text("❌ Payment cancelled.",reply_markup=back_main_keyboard())
+    except Exception as e: await q.answer(str(e),show_alert=True)
+
+
+async def text_message_handler(update, context):
+    if not update.message: return
+    payment_id=context.user_data.get("awaiting_payment_tx")
+    if payment_id:
+        raw=update.message.text.strip()
+        if len(raw)<3 or len(raw)>100:
+            await update.message.reply_text("❌ Invalid Binance Order ID. Please send the Order ID as text."); return
+        payment=get_payment(payment_id)
+        if not payment or payment["telegram_id"]!=update.effective_user.id or payment["status"]!="pending":
+            context.user_data.pop("awaiting_payment_tx",None)
+            await update.message.reply_text("This payment is no longer pending.",reply_markup=main_menu_keyboard()); return
+        try:
+            submit_payment_reference(payment_id,raw); context.user_data.pop("awaiting_payment_tx",None)
+            await update.message.reply_text(f"✅ Payment reference submitted.\n\nPayment #{payment_id} is waiting for admin confirmation.\nYou do not need to restart your purchase.",reply_markup=main_menu_keyboard())
+            for admin_id in ADMIN_IDS:
+                try: await context.bot.send_message(admin_id,f"💳 PAYMENT REFERENCE SUBMITTED\nPayment #{payment_id}\nUser: {update.effective_user.id}\nBinance Order ID: {raw}\n\nApprove with /approve_payment {payment_id}")
+                except Exception: pass
+        except Exception as e: await update.message.reply_text(f"❌ {e}")
+        return
+    await update.message.reply_text("🏠 Please use the buttons below.",reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(f"🏠 {STORE_NAME}\n━━━━━━━━━━━━━━━━\n\nChoose an option below.",reply_markup=main_menu_keyboard())
+
+
+async def buy_vpn(update, context):
+    q=update.callback_query; await q.answer(); kb=[[InlineKeyboardButton("03 Days",callback_data="vpn_03_days"),InlineKeyboardButton("07 Days",callback_data="vpn_07_days")],[InlineKeyboardButton("14 Days",callback_data="vpn_14_days"),InlineKeyboardButton("30 Days",callback_data="vpn_30_days")],[InlineKeyboardButton("🏠 Main Menu",callback_data="main_menu")]]; await q.edit_message_text("🔐 BUY VPN\n━━━━━━━━━━━━━━━━\n\n📅 Select validity:",reply_markup=InlineKeyboardMarkup(kb))
+
+async def vpn_03_days(update,context):
+    q=update.callback_query; await q.answer(); kb=[[InlineKeyboardButton("Express VPN",callback_data="vpn_product_express_3"),InlineKeyboardButton("CyberGhost VPN",callback_data="vpn_product_cyberghost_3")],[InlineKeyboardButton("Vypr VPN",callback_data="vpn_product_vypr_3"),InlineKeyboardButton("Panda VPN",callback_data="vpn_product_panda_3")],[InlineKeyboardButton("🔙 Back",callback_data="buy_vpn")]]; await q.edit_message_text("🔐 VPN — 03 DAYS\n━━━━━━━━━━━━━━━━\n\nSelect a VPN:",reply_markup=InlineKeyboardMarkup(kb))
+
+async def vpn_07_days(update,context):
+    q=update.callback_query; await q.answer(); kb=[[InlineKeyboardButton("Express VPN",callback_data="vpn_product_express_7"),InlineKeyboardButton("Nord VPN",callback_data="vpn_product_nord_7")],[InlineKeyboardButton("PIA VPN",callback_data="vpn_product_pia_7"),InlineKeyboardButton("IPVanish VPN",callback_data="vpn_product_ipvanish_7")],[InlineKeyboardButton("Surfshark VPN",callback_data="vpn_product_surfshark_7"),InlineKeyboardButton("HotspotShield VPN",callback_data="vpn_product_hotspotshield_7")],[InlineKeyboardButton("HMA VPN",callback_data="vpn_product_hma_7"),InlineKeyboardButton("Pure VPN",callback_data="vpn_product_pure_7")],[InlineKeyboardButton("🔙 Back",callback_data="buy_vpn"),InlineKeyboardButton("Next ➡️",callback_data="vpn_07_page_2")]]; await q.edit_message_text("🔐 VPN — 07 DAYS\n━━━━━━━━━━━━━━━━\n\nPage 1",reply_markup=InlineKeyboardMarkup(kb))
+
+async def vpn_07_page_2(update,context):
+    q=update.callback_query; await q.answer(); kb=[[InlineKeyboardButton("Turbo VPN",callback_data="vpn_product_turbo_7"),InlineKeyboardButton("Avast VPN",callback_data="vpn_product_avast_7")],[InlineKeyboardButton("AdGuard VPN",callback_data="vpn_product_adguard_7"),InlineKeyboardButton("Norton VPN",callback_data="vpn_product_norton_7")],[InlineKeyboardButton("AVG VPN",callback_data="vpn_product_avg_7"),InlineKeyboardButton("X-VPN",callback_data="vpn_product_x_7")],[InlineKeyboardButton("Sky VPN",callback_data="vpn_product_sky_7"),InlineKeyboardButton("Potato VPN",callback_data="vpn_product_potato_7")],[InlineKeyboardButton("🔙 Back",callback_data="vpn_07_days"),InlineKeyboardButton("Next ➡️",callback_data="vpn_07_page_3")]]; await q.edit_message_text("🔐 VPN — 07 DAYS\n━━━━━━━━━━━━━━━━\n\nPage 2",reply_markup=InlineKeyboardMarkup(kb))
+
+async def vpn_07_page_3(update,context):
+    q=update.callback_query; await q.answer(); kb=[[InlineKeyboardButton("Bitdefender VPN",callback_data="vpn_product_bitdefender_7")],[InlineKeyboardButton("🔙 Back",callback_data="vpn_07_page_2")]]; await q.edit_message_text("🔐 VPN — 07 DAYS\n━━━━━━━━━━━━━━━━\n\nPage 3",reply_markup=InlineKeyboardMarkup(kb))
+
+async def vpn_14_days(update,context):
+    q=update.callback_query; await q.answer(); kb=[[InlineKeyboardButton("Octohide",callback_data="vpn_product_octohide_14")],[InlineKeyboardButton("🔙 Back",callback_data="buy_vpn")]]; await q.edit_message_text("🔐 VPN — 14 DAYS\n━━━━━━━━━━━━━━━━\n\nSelect a VPN:",reply_markup=InlineKeyboardMarkup(kb))
+
+async def vpn_30_days(update,context):
+    q=update.callback_query; await q.answer(); kb=[[InlineKeyboardButton("Express VPN (1 Device)",callback_data="vpn_product_express_30"),InlineKeyboardButton("Nord VPN",callback_data="vpn_product_nord_30")],[InlineKeyboardButton("PIA VPN (1 Device)",callback_data="vpn_product_pia_30"),InlineKeyboardButton("Avast VPN",callback_data="vpn_product_avast_30")],[InlineKeyboardButton("Bitdefender VPN",callback_data="vpn_product_bitdefender_30"),InlineKeyboardButton("HMA VPN",callback_data="vpn_product_hma_30")],[InlineKeyboardButton("Mysterium VPN",callback_data="vpn_product_mysterium_30"),InlineKeyboardButton("MYSTERIUM DARK",callback_data="vpn_product_mysterium_dark_30")],[InlineKeyboardButton("Windscribe VPN",callback_data="vpn_product_windscribe_30"),InlineKeyboardButton("Proton VPN",callback_data="vpn_product_proton_30")],[InlineKeyboardButton("🔙 Back",callback_data="buy_vpn")]]; await q.edit_message_text("🔐 VPN — 30 DAYS\n━━━━━━━━━━━━━━━━\n\nSelect a VPN:",reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def coming_soon(update,context):
+    q=update.callback_query; await q.answer(); await q.edit_message_text("🚧 COMING SOON\n\nThis category will be available soon.",reply_markup=back_main_keyboard())
+
+async def buy_proxy(update,context):
+    q=update.callback_query; await q.answer(); await q.edit_message_text("🌐 BUY PROXY\n━━━━━━━━━━━━━━━━\n\n🚧 Coming soon.",reply_markup=back_main_keyboard())
+async def verification_service(update,context):
+    q=update.callback_query; await q.answer(); await q.edit_message_text("🧑‍💻 VERIFICATION SERVICES\n━━━━━━━━━━━━━━━━\n\n🚧 Coming soon.",reply_markup=back_main_keyboard())
+
+async def buy_more_products(update,context):
+    q=update.callback_query; await q.answer(); kb=[[InlineKeyboardButton("📧 Email Accounts",callback_data="coming_soon_email"),InlineKeyboardButton("⭐ Premium Apps",callback_data="coming_soon_premium")],[InlineKeyboardButton("💻 Software & Tools",callback_data="coming_soon_software"),InlineKeyboardButton("🎮 Gaming Products",callback_data="coming_soon_gaming")],[InlineKeyboardButton("🏠 Main Menu",callback_data="main_menu")]]; await q.edit_message_text("🛍️ BUY MORE PRODUCTS\n━━━━━━━━━━━━━━━━\n\nSelect a category:",reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def add_balance(update,context):
+    q=update.callback_query; await q.answer(); context.user_data["awaiting_balance_amount"]=True
+    await q.edit_message_text("💰 ADD BALANCE\n━━━━━━━━━━━━━━━━\n\nEnter the USD amount you want to add.\nMinimum: $0.10\n\nExample: 10",reply_markup=back_main_keyboard())
+
+async def create_balance_payment_from_text(update,context,amount):
+    if amount<0.10: await update.message.reply_text("❌ Minimum amount is $0.10."); return
+    payment_id=create_payment(update.effective_user.id,round(amount,2),"binance_pay",None,"USD")
+    context.user_data["awaiting_balance_tx"]=payment_id; context.user_data.pop("awaiting_balance_amount",None)
+    pay_id=get_setting("binance_pay_id","Not configured yet")
+    await update.message.reply_text(f"💳 BINANCE PAY\n━━━━━━━━━━━━━━━━\n\nPayment #{payment_id}\nAmount: ${amount:.2f}\nBinance Pay ID: {pay_id}\n\nSend the payment, then send your Binance Order ID here.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data=f"cancel_user_payment:{payment_id}")]]))
+    for admin_id in ADMIN_IDS:
+        try: await context.bot.send_message(admin_id,f"🔔 NEW BALANCE PAYMENT\nPayment #{payment_id}\nUser: {update.effective_user.id}\nAmount: ${amount:.2f}\nWaiting for Binance Order ID.")
+        except Exception: pass
+
+
+async def add_balance_text_handler(update,context):
+    if not update.message: return False
+    if context.user_data.get("awaiting_balance_amount"):
+        raw=update.message.text.strip()
+        try: amount=float(raw)
+        except ValueError: await update.message.reply_text("❌ Please enter a valid USD amount, for example 10."); return True
+        await create_balance_payment_from_text(update,context,amount); return True
+    return False
+
+
+async def my_orders(update,context):
+    q=update.callback_query; await q.answer(); rows=get_recent_orders(update.effective_user.id,24,20)
+    if not rows:
+        await q.edit_message_text("📦 MY ORDERS\n━━━━━━━━━━━━━━━━\n\nNo completed orders in the last 24 hours.",reply_markup=back_main_keyboard()); return
+    parts=["📦 MY ORDERS — LAST 24 HOURS","━━━━━━━━━━━━━━━━"]
+    for order in rows:
+        parts.append(f"\n🧾 Order #{order['id']}\nProduct: {order['name']}\nQty: {order['quantity']}\nTotal: ${float(order['total_amount']):.2f}\nStatus: {order['status']}")
+        items=get_order_items(order["id"])
+        for i,item in enumerate(items,1):
+            content=item["delivered_content"] or ""
+            # Mask likely password-looking fields in the display without modifying stored delivery.
+            masked=content
+            if "password:" in masked.lower():
+                import re
+                masked=re.sub(r"(?i)(password\s*:\s*)([^\s\n]+)",r"\1••••••",masked)
+            parts.append(f"  #{i}: {masked}")
+    await q.edit_message_text("\n".join(parts),reply_markup=back_main_keyboard())
+
+async def refer(update,context):
+    q=update.callback_query; await q.answer(); user=update.effective_user; ensure_user(update); bot_username=context.bot.username; link=f"https://t.me/{bot_username}?start=ref_{user.id}" if bot_username else "Referral link unavailable"; u=get_user(user.id); commission=get_setting("referral_commission",str(DEFAULT_REFERRAL_COMMISSION)); limit=get_setting("referral_deposit_limit",str(DEFAULT_REFERRAL_DEPOSIT_LIMIT)); await q.edit_message_text(f"👥 REFERRAL PROGRAM\n━━━━━━━━━━━━━━━━\n\n🎯 Your Referral Link:\n{link}\n\n💰 Commission: {commission}%\n📌 Commission applies to the first {limit} deposits.\n\n📊 Total Referrals: {u['total_referrals']}\n🎁 Referral Income: ${float(u['referral_income']):.2f}",reply_markup=back_main_keyboard())
+
+async def support(update,context):
+    q=update.callback_query; await q.answer(); await q.edit_message_text(f"🎧 SUPPORT\n━━━━━━━━━━━━━━━━\n\nFor support, please contact:\n{SUPPORT_USERNAME}",reply_markup=back_main_keyboard())
+
+
+async def admin_only(update):
+    return update.effective_user and update.effective_user.id in ADMIN_IDS
+
+async def pending_payments(update,context):
+    if not await admin_only(update): return
+    # This command intentionally gives a concise queue; approval is still explicit.
+    from db import get_connection
+    con=get_connection(); cur=con.cursor(); cur.execute("""SELECT p.id,p.amount,p.transaction_id,p.created_at,u.telegram_id,pi.product_id,pi.quantity,pr.name
+        FROM payments p JOIN users u ON u.id=p.user_id LEFT JOIN purchase_intents pi ON pi.id=p.purchase_intent_id LEFT JOIN products pr ON pr.id=pi.product_id
+        WHERE p.status='pending' ORDER BY p.id ASC LIMIT 50"""); rows=cur.fetchall(); con.close()
+    if not rows: await update.message.reply_text("No pending payments."); return
+    lines=["💳 PENDING PAYMENTS"]
+    for r in rows: lines.append(f"\n#{r['id']} — ${float(r['amount']):.2f}\nUser: {r['telegram_id']}\nProduct: {r['name'] or 'Balance top-up'} x{r['quantity'] or '-'}\nTX: {r['transaction_id'] or 'not submitted'}\nApprove: /approve_payment {r['id']}")
+    await update.message.reply_text("\n".join(lines))
+
+async def approve_payment_cmd(update,context):
+    if not await admin_only(update): return
+    if not context.args or not context.args[0].isdigit(): await update.message.reply_text("Usage: /approve_payment PAYMENT_ID"); return
+    payment_id=int(context.args[0]); payment=get_payment(payment_id)
+    if not payment: await update.message.reply_text("Payment not found."); return
+    if not payment["transaction_id"]: await update.message.reply_text("This payment has no Binance Order ID yet."); return
+    try:
+        result=confirm_payment(payment_id,update.effective_user.id)
+        purchase=result.get("purchase")
+        await update.message.reply_text(f"✅ Payment #{payment_id} confirmed." + (f"\nOrder #{purchase['order_id']} completed and delivered." if purchase else "\nBalance credited."))
+        if purchase and not purchase.get("already_completed"):
+            await context.bot.send_message(purchase["telegram_id"],f"✅ PAYMENT CONFIRMED & ORDER COMPLETED\n━━━━━━━━━━━━━━━━\nPayment #{payment_id}\nOrder #{purchase['order_id']}\nProduct: {purchase['product_name']}\nQuantity: {purchase['quantity']}\nTotal: ${purchase['total']:.2f}\nRemaining balance: ${purchase['balance_after']:.2f}\n\n{format_delivery(purchase['delivered'])}",reply_markup=back_main_keyboard())
+        else:
+            p=get_payment(payment_id); await context.bot.send_message(p["telegram_id"],f"✅ Payment #{payment_id} confirmed. Your balance has been credited.",reply_markup=main_menu_keyboard())
+    except Exception as e: await update.message.reply_text(f"❌ Could not approve: {e}")
+
+async def cancel_payment_cmd(update,context):
+    if not await admin_only(update): return
+    if not context.args or not context.args[0].isdigit(): await update.message.reply_text("Usage: /cancel_payment PAYMENT_ID"); return
+    try:
+        cancel_payment(int(context.args[0]),update.effective_user.id,"Cancelled by admin")
+        await update.message.reply_text("✅ Payment cancelled.")
+    except Exception as e: await update.message.reply_text(f"❌ {e}")
+
+async def error_handler(update,context): print("Bot error:",context.error)
+
 
 def main():
-
-    # --------------------------------------------------------
-    # Check BOT TOKEN
-    # --------------------------------------------------------
-
-    if not BOT_TOKEN:
-
-        raise RuntimeError(
-            "BOT_TOKEN is missing. "
-            "Please add BOT_TOKEN in Railway Variables."
-        )
-
-    # --------------------------------------------------------
-    # Initialize Database
-    # --------------------------------------------------------
-
+    if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN is missing. Please add BOT_TOKEN in Railway Variables.")
     init_db()
+    application=Application.builder().token(BOT_TOKEN).build()
 
-    # --------------------------------------------------------
-    # Database Health Check
-    # --------------------------------------------------------
+    application.add_handler(CommandHandler("start",start))
+    application.add_handler(CommandHandler("pending_payments",pending_payments))
+    application.add_handler(CommandHandler("approve_payment",approve_payment_cmd))
+    application.add_handler(CommandHandler("cancel_payment",cancel_payment_cmd))
 
-    if not database_health_check():
+    application.add_handler(CallbackQueryHandler(show_main_menu,pattern="^main_menu$"))
+    application.add_handler(CallbackQueryHandler(show_profile,pattern="^my_profile$"))
+    application.add_handler(CallbackQueryHandler(communication_apps,pattern="^communication_apps$"))
+    application.add_handler(CallbackQueryHandler(google_voice,pattern="^google_voice$"))
+    application.add_handler(CallbackQueryHandler(textnow,pattern="^textnow$"))
+    application.add_handler(CallbackQueryHandler(textfree,pattern="^textfree$"))
+    application.add_handler(CallbackQueryHandler(sideline,pattern="^sideline$"))
+    application.add_handler(CallbackQueryHandler(talkatone,pattern="^talkatone$"))
+    application.add_handler(CallbackQueryHandler(textplus,pattern="^textplus$"))
+    application.add_handler(CallbackQueryHandler(quantity_selected,pattern="^buyqty:"))
+    application.add_handler(CallbackQueryHandler(confirm_buy,pattern="^confirmbuy:"))
+    application.add_handler(CallbackQueryHandler(pay_purchase,pattern="^paypurchase:"))
+    application.add_handler(CallbackQueryHandler(enter_payment,pattern="^enterpay:"))
+    application.add_handler(CallbackQueryHandler(cancel_user_payment,pattern="^cancel_user_payment:"))
+    application.add_handler(CallbackQueryHandler(communication_product,pattern="^product_"))
+    application.add_handler(CallbackQueryHandler(buy_vpn,pattern="^buy_vpn$"))
+    application.add_handler(CallbackQueryHandler(vpn_03_days,pattern="^vpn_03_days$"))
+    application.add_handler(CallbackQueryHandler(vpn_07_days,pattern="^vpn_07_days$"))
+    application.add_handler(CallbackQueryHandler(vpn_07_page_2,pattern="^vpn_07_page_2$"))
+    application.add_handler(CallbackQueryHandler(vpn_07_page_3,pattern="^vpn_07_page_3$"))
+    application.add_handler(CallbackQueryHandler(vpn_14_days,pattern="^vpn_14_days$"))
+    application.add_handler(CallbackQueryHandler(vpn_30_days,pattern="^vpn_30_days$"))
+    application.add_handler(CallbackQueryHandler(vpn_product,pattern="^vpn_product_"))
+    application.add_handler(CallbackQueryHandler(buy_proxy,pattern="^buy_proxy$"))
+    application.add_handler(CallbackQueryHandler(verification_service,pattern="^verification_service$"))
+    application.add_handler(CallbackQueryHandler(buy_more_products,pattern="^buy_more_products$"))
+    application.add_handler(CallbackQueryHandler(coming_soon,pattern="^coming_soon_"))
+    application.add_handler(CallbackQueryHandler(add_balance,pattern="^add_balance$"))
+    application.add_handler(CallbackQueryHandler(my_orders,pattern="^my_orders$"))
+    application.add_handler(CallbackQueryHandler(refer,pattern="^refer$"))
+    application.add_handler(CallbackQueryHandler(support,pattern="^support$"))
 
-        raise RuntimeError(
-            "Database health check failed."
-        )
+    # Text handler first checks active payment/amount states.
+    async def text_router(update,context):
+        if await add_balance_text_handler(update,context): return
+        await text_message_handler(update,context)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_router))
+    application.add_error_handler(error_handler)
 
-    # --------------------------------------------------------
-    # Build Application
-    # --------------------------------------------------------
-
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    # ========================================================
-    # COMMANDS
-    # ========================================================
-
-    application.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
-    )
-
-    # ========================================================
-    # MAIN MENU
-    # ========================================================
-
-    application.add_handler(
-        CallbackQueryHandler(
-            show_main_menu,
-            pattern="^main_menu$"
-        )
-    )
-
-    # ========================================================
-    # PROFILE
-    # ========================================================
-
-    application.add_handler(
-        CallbackQueryHandler(
-            show_profile,
-            pattern="^my_profile$"
-        )
-    )
-
-    # ========================================================
-    # COMMUNICATION APPS
-    # ========================================================
-
-    application.add_handler(
-        CallbackQueryHandler(
-            communication_apps,
-            pattern="^communication_apps$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            google_voice,
-            pattern="^google_voice$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            textnow,
-            pattern="^textnow$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            textfree,
-            pattern="^textfree$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            sideline,
-            pattern="^sideline$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            talkatone,
-            pattern="^talkatone$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            textplus,
-            pattern="^textplus$"
-        )
-    )
-
-    # ========================================================
-    # COMMUNICATION PRODUCTS
-    # ========================================================
-
-    application.add_handler(
-        CallbackQueryHandler(
-            communication_product,
-            pattern="^product_"
-        )
-    )
-
-    # ========================================================
-    # VPN
-    # ========================================================
-
-    application.add_handler(
-        CallbackQueryHandler(
-            buy_vpn,
-            pattern="^buy_vpn$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            vpn_03_days,
-            pattern="^vpn_03_days$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            vpn_07_days,
-            pattern="^vpn_07_days$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            vpn_07_page_2,
-            pattern="^vpn_07_page_2$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            vpn_07_page_3,
-            pattern="^vpn_07_page_3$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            vpn_14_days,
-            pattern="^vpn_14_days$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            vpn_30_days,
-            pattern="^vpn_30_days$"
-        )
-    )
-
-    # ========================================================
-    # VPN PRODUCTS
-    # ========================================================
-
-    application.add_handler(
-        CallbackQueryHandler(
-            vpn_product,
-            pattern="^vpn_product_"
-        )
-    )
-
-    # ========================================================
-    # PROXY
-    # ========================================================
-
-    application.add_handler(
-        CallbackQueryHandler(
-            buy_proxy,
-            pattern="^buy_proxy$"
-        )
-    )
-
-    # ========================================================
-    # VERIFICATION
-    # ========================================================
-
-    application.add_handler(
-        CallbackQueryHandler(
-            verification_service,
-            pattern="^verification_service$"
-        )
-    )
-
-    # ========================================================
-    # BUY MORE PRODUCTS
-    # ========================================================
-
-    application.add_handler(
-        CallbackQueryHandler(
-            buy_more_products,
-            pattern="^buy_more_products$"
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            coming_soon_category,
-            pattern=(
-                "^(email_accounts|"
-                "premium_apps|"
-                "software_tools|"
-                "gaming_products)$"
-            )
-        )
-    )
-
-    # ========================================================
-    # ADD BALANCE
-    # ========================================================
-
-    application.add_handler(
-        CallbackQueryHandler(
-            add_balance,
-            pattern="^add_balance$"
-        )
-    )
-
-    # ========================================================
-    # MY ORDERS
-    # ========================================================
-
-    application.add_handler(
-        CallbackQueryHandler(
-            my_orders,
-            pattern="^my_orders$"
-        )
-    )
-
-    # ========================================================
-    # REFERRAL
-    # ========================================================
-
-    application.add_handler(
-        CallbackQueryHandler(
-            refer,
-            pattern="^refer$"
-        )
-    )
-
-    # ========================================================
-    # SUPPORT
-    # ========================================================
-
-    application.add_handler(
-        CallbackQueryHandler(
-            support,
-            pattern="^support$"
-        )
-    )
-
-    # ========================================================
-    # ERROR HANDLER
-    # ========================================================
-
-    application.add_error_handler(
-        error_handler
-    )
-
-    # ========================================================
-    # TEXT HANDLER
-    # ========================================================
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_unknown_message
-        )
-    )
-
-    # ========================================================
-    # RUN BOT
-    # ========================================================
-
-    print(
-        f"{STORE_NAME} bot is running..."
-    )
-
+    print(f"{STORE_NAME} Stage 3 bot is running...")
     application.run_polling()
 
-
-# ============================================================
-# RUN
-# ============================================================
-
-if __name__ == "__main__":
-
-    main()
+if __name__ == "__main__": main()
