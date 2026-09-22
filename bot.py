@@ -218,21 +218,7 @@ async def send_purchase_delivery(bot, purchase):
         await bot.send_message(chat_id=chat_id, text=text)
 
 
-def clear_flow_states(context):
-    """Clear transient conversation states when the user returns to a top-level menu.
-    This prevents an old admin/customer input prompt from capturing unrelated messages.
-    """
-    for key in (
-        "admin_input", "admin_customer_search",
-        "awaiting_balance_amount", "balance_payment_amount",
-        "awaiting_payment_tx", "purchase_payment_selection",
-        "custom_quantity_product", "awaiting_custom_quantity",
-    ):
-        context.user_data.pop(key, None)
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    clear_flow_states(context)
     user = update.effective_user
     if not user or not update.message:
         return
@@ -257,7 +243,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    clear_flow_states(context)
     q=update.callback_query; await q.answer()
     await q.edit_message_text(f"🏠 {STORE_NAME}\n━━━━━━━━━━━━━━━━\n\nChoose an option below.", reply_markup=main_menu_keyboard())
 
@@ -545,7 +530,22 @@ async def text_message_handler(update, context):
             submit_payment_reference(payment_id,raw); context.user_data.pop("awaiting_payment_tx",None)
             await update.message.reply_text(f"✅ Payment reference submitted.\n\nPayment #{payment_id} is waiting for admin confirmation.\nYou do not need to restart your purchase.",reply_markup=main_menu_keyboard())
             for admin_id in ADMIN_IDS:
-                try: await context.bot.send_message(admin_id,f"💳 PAYMENT REFERENCE SUBMITTED\nPayment #{payment_id}\nUser: {update.effective_user.id}\nTransaction ID: {raw}\n\nApprove with /approve_payment {payment_id}")
+                try:
+                    admin_kb = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("✅ Accept Payment", callback_data=f"admin_payment_accept:{payment_id}"),
+                            InlineKeyboardButton("❌ Cancel Payment", callback_data=f"admin_payment_cancel:{payment_id}"),
+                        ]
+                    ])
+                    await context.bot.send_message(
+                        admin_id,
+                        f"💳 PAYMENT REFERENCE SUBMITTED\n━━━━━━━━━━━━━━━━\n\n"
+                        f"Payment #{payment_id}\n"
+                        f"User: {update.effective_user.id}\n"
+                        f"Transaction ID: {raw}\n\n"
+                        "Choose an action below:",
+                        reply_markup=admin_kb,
+                    )
                 except Exception: pass
         except Exception as e: await update.message.reply_text(f"❌ {e}")
         return
@@ -587,7 +587,6 @@ async def buy_more_products(update,context):
 
 
 async def add_balance(update,context):
-    clear_flow_states(context)
     q=update.callback_query; await q.answer(); context.user_data["awaiting_balance_amount"]=True
     await q.edit_message_text("💰 ADD BALANCE\n━━━━━━━━━━━━━━━━\n\nEnter the USD amount you want to add.\nMinimum: $0.10\n\nExample: 10",reply_markup=back_main_keyboard())
 
@@ -697,6 +696,114 @@ async def cancel_payment_cmd(update,context):
         cancel_payment(int(context.args[0]),update.effective_user.id,"Cancelled by admin")
         await update.message.reply_text("✅ Payment cancelled.")
     except Exception as e: await update.message.reply_text(f"❌ {e}")
+
+
+async def admin_payment_accept_callback(update, context):
+    q = update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True)
+        return
+    try:
+        payment_id = int(q.data.split(":", 1)[1])
+    except Exception:
+        await q.answer("Invalid payment.", show_alert=True)
+        return
+
+    payment = get_payment(payment_id)
+    if not payment:
+        await q.answer("Payment not found.", show_alert=True)
+        return
+    if not payment["transaction_id"]:
+        await q.answer("This payment has no transaction/order ID yet.", show_alert=True)
+        return
+
+    try:
+        result = confirm_payment(payment_id, update.effective_user.id)
+        purchase = result.get("purchase")
+        commission = float(result.get("referral_commission", 0) or 0)
+
+        if purchase and not purchase.get("already_completed"):
+            await q.answer("Payment accepted.")
+            await q.edit_message_text(
+                f"✅ PAYMENT ACCEPTED\n━━━━━━━━━━━━━━━━\n\n"
+                f"Payment #{payment_id}\n"
+                f"User: {payment['telegram_id']}\n"
+                f"Transaction ID: {payment['transaction_id']}\n\n"
+                f"Order #{purchase['order_id']} completed and delivered."
+                + (f"\nReferral commission: ${commission:.2f}" if commission > 0 else "")
+            )
+            await context.bot.send_message(
+                purchase["telegram_id"],
+                f"✅ PAYMENT CONFIRMED & ORDER COMPLETED\n━━━━━━━━━━━━━━━━\n\n"
+                f"Payment #{payment_id}\n"
+                f"Order #{purchase['order_id']}\n"
+                f"Product: {purchase['product_name']}\n"
+                f"Quantity: {purchase['quantity']}\n"
+                f"Total: ${purchase['total']:.2f}\n"
+                f"Remaining balance: ${purchase['balance_after']:.2f}\n\n"
+                "📦 Delivery is being sent...",
+                reply_markup=back_main_keyboard(),
+            )
+            await send_purchase_delivery(context.bot, purchase)
+        else:
+            await q.answer("Payment accepted.")
+            await q.edit_message_text(
+                f"✅ PAYMENT ACCEPTED\n━━━━━━━━━━━━━━━━\n\n"
+                f"Payment #{payment_id}\n"
+                f"User: {payment['telegram_id']}\n"
+                f"Transaction ID: {payment['transaction_id']}\n\n"
+                "Balance has been credited."
+                + (f"\nReferral commission: ${commission:.2f}" if commission > 0 else "")
+            )
+            await context.bot.send_message(
+                payment["telegram_id"],
+                f"✅ PAYMENT CONFIRMED\n━━━━━━━━━━━━━━━━\n\n"
+                f"Payment #{payment_id} confirmed.\n"
+                "Your balance has been credited successfully.",
+                reply_markup=main_menu_keyboard(),
+            )
+    except Exception as e:
+        await q.answer(f"Could not accept: {e}", show_alert=True)
+
+
+async def admin_payment_cancel_callback(update, context):
+    q = update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True)
+        return
+    try:
+        payment_id = int(q.data.split(":", 1)[1])
+    except Exception:
+        await q.answer("Invalid payment.", show_alert=True)
+        return
+
+    payment = get_payment(payment_id)
+    if not payment:
+        await q.answer("Payment not found.", show_alert=True)
+        return
+    if payment["status"] != "pending":
+        await q.answer(f"Payment is already {payment['status']}.", show_alert=True)
+        return
+
+    try:
+        cancel_payment(payment_id, update.effective_user.id, "Cancelled by admin")
+        await q.answer("Payment cancelled.")
+        await q.edit_message_text(
+            f"❌ PAYMENT CANCELLED\n━━━━━━━━━━━━━━━━\n\n"
+            f"Payment #{payment_id}\n"
+            f"User: {payment['telegram_id']}\n"
+            f"Transaction ID: {payment['transaction_id'] or 'Not submitted'}\n\n"
+            "The payment was cancelled by admin."
+        )
+        await context.bot.send_message(
+            payment["telegram_id"],
+            f"❌ PAYMENT CANCELLED\n━━━━━━━━━━━━━━━━\n\n"
+            f"Payment #{payment_id} has been cancelled by admin.\n"
+            "No balance was credited and the pending purchase was cancelled.",
+            reply_markup=main_menu_keyboard(),
+        )
+    except Exception as e:
+        await q.answer(f"Could not cancel: {e}", show_alert=True)
 
 
 # =========================
@@ -1060,14 +1167,12 @@ def admin_settings_kb():
     return InlineKeyboardMarkup([[InlineKeyboardButton("👥 Referral Settings",callback_data="admin_referrals")],[InlineKeyboardButton("💱 USD / BDT Rate",callback_data="admin_rate")],[InlineKeyboardButton("💳 Payment Methods",callback_data="admin_payment_methods")],[InlineKeyboardButton("🔙 Admin Panel",callback_data="admin_panel")]])
 
 async def admin_settings(update,context):
-    context.user_data.pop("admin_input", None)
     q=update.callback_query
     if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
     await q.answer(); settings=admin_get_settings()
     await q.edit_message_text(f"⚙️ SETTINGS\n━━━━━━━━━━━━━━━━\n\nStore: {settings.get('store_name','JanKug Store')}\nSupport: {settings.get('support_username','@JanKug')}\nReferral commission: {settings.get('referral_commission','5')}%\nReferral deposit limit: {settings.get('referral_deposit_limit','10')}\nUSD/BDT rate: 1 USD = {settings.get('usd_bdt_rate','127')} BDT",reply_markup=admin_settings_kb())
 
 async def admin_referrals(update,context):
-    context.user_data.pop("admin_input", None)
     q=update.callback_query
     if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
     await q.answer(); commission=get_setting("referral_commission","5"); limit=get_setting("referral_deposit_limit","10")
@@ -1084,7 +1189,6 @@ async def admin_referral_limit_prompt(update,context):
     context.user_data["admin_input"]={"kind":"referral_limit"}; await q.answer(); await q.edit_message_text("🔢 CHANGE DEPOSIT LIMIT\n\nSend how many first deposits qualify.\nExample: 10",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_referrals")]]))
 
 async def admin_rate(update,context):
-    context.user_data.pop("admin_input", None)
     q=update.callback_query
     if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
     await q.answer(); rate=get_setting("usd_bdt_rate","127")
@@ -1103,7 +1207,6 @@ def _payment_methods_admin_kb(methods):
     rows.append([InlineKeyboardButton("➕ Add Payment Method",callback_data="admin_payment_add")]); rows.append([InlineKeyboardButton("🔙 Settings",callback_data="admin_settings")]); return InlineKeyboardMarkup(rows)
 
 async def admin_payment_methods(update,context):
-    context.user_data.pop("admin_input", None)
     q=update.callback_query
     if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
     await q.answer(); await q.edit_message_text("💳 PAYMENT METHODS\n━━━━━━━━━━━━━━━━\n\nSelect a method to edit/toggle, or add a new one.",reply_markup=_payment_methods_admin_kb(admin_list_payment_methods(True)))
@@ -1117,7 +1220,6 @@ async def admin_payment_method_detail(update,context):
     await q.edit_message_text(f"💳 PAYMENT METHOD #{mid}\n━━━━━━━━━━━━━━━━\n\nName: {m['name']}\nType: {m['method_type']}\nCurrency: {m['currency']}\nRate: {rate:g}\nStatus: {status}\n\nDetails:\n{m['details'] or '(empty)'}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Edit",callback_data=f"admin_payment_edit:{mid}")],[InlineKeyboardButton("🔄 Enable / Disable",callback_data=f"admin_payment_toggle:{mid}")],[InlineKeyboardButton("🔙 Payment Methods",callback_data="admin_payment_methods")]]))
 
 async def admin_payment_add_prompt(update,context):
-    context.user_data.pop("admin_input", None)
     q=update.callback_query
     if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
     context.user_data["admin_input"]={"kind":"payment_add"}; await q.answer(); await q.edit_message_text("➕ ADD PAYMENT METHOD\n━━━━━━━━━━━━━━━━\n\nSend ONE line:\nName | type | currency | exchange_rate | details\n\nExamples:\nBinance Pay | binance_pay | USD | 1 | Binance Pay ID: 123456\nbKash | bkash | BDT | 127 | Number: 01XXXXXXXXX\nNagad | nagad | BDT | 127 | Number: 01XXXXXXXXX",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_payment_methods")]]))
@@ -1578,6 +1680,8 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_payment_add_prompt,pattern="^admin_payment_add$"))
     application.add_handler(CallbackQueryHandler(admin_payment_edit_prompt,pattern="^admin_payment_edit:"))
     application.add_handler(CallbackQueryHandler(admin_payment_toggle,pattern="^admin_payment_toggle:"))
+    application.add_handler(CallbackQueryHandler(admin_payment_accept_callback,pattern="^admin_payment_accept:"))
+    application.add_handler(CallbackQueryHandler(admin_payment_cancel_callback,pattern="^admin_payment_cancel:"))
     application.add_handler(CallbackQueryHandler(admin_dashboard,pattern="^admin_dashboard$"))
     application.add_handler(CallbackQueryHandler(admin_products_callback,pattern="^admin_products$"))
     application.add_handler(CallbackQueryHandler(admin_products_page,pattern="^admin_products_page:"))
