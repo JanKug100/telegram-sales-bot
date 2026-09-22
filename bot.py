@@ -218,7 +218,21 @@ async def send_purchase_delivery(bot, purchase):
         await bot.send_message(chat_id=chat_id, text=text)
 
 
+def clear_flow_states(context):
+    """Clear transient conversation states when the user returns to a top-level menu.
+    This prevents an old admin/customer input prompt from capturing unrelated messages.
+    """
+    for key in (
+        "admin_input", "admin_customer_search",
+        "awaiting_balance_amount", "balance_payment_amount",
+        "awaiting_payment_tx", "purchase_payment_selection",
+        "custom_quantity_product", "awaiting_custom_quantity",
+    ):
+        context.user_data.pop(key, None)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_flow_states(context)
     user = update.effective_user
     if not user or not update.message:
         return
@@ -243,6 +257,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_flow_states(context)
     q=update.callback_query; await q.answer()
     await q.edit_message_text(f"🏠 {STORE_NAME}\n━━━━━━━━━━━━━━━━\n\nChoose an option below.", reply_markup=main_menu_keyboard())
 
@@ -572,6 +587,7 @@ async def buy_more_products(update,context):
 
 
 async def add_balance(update,context):
+    clear_flow_states(context)
     q=update.callback_query; await q.answer(); context.user_data["awaiting_balance_amount"]=True
     await q.edit_message_text("💰 ADD BALANCE\n━━━━━━━━━━━━━━━━\n\nEnter the USD amount you want to add.\nMinimum: $0.10\n\nExample: 10",reply_markup=back_main_keyboard())
 
@@ -1044,12 +1060,14 @@ def admin_settings_kb():
     return InlineKeyboardMarkup([[InlineKeyboardButton("👥 Referral Settings",callback_data="admin_referrals")],[InlineKeyboardButton("💱 USD / BDT Rate",callback_data="admin_rate")],[InlineKeyboardButton("💳 Payment Methods",callback_data="admin_payment_methods")],[InlineKeyboardButton("🔙 Admin Panel",callback_data="admin_panel")]])
 
 async def admin_settings(update,context):
+    context.user_data.pop("admin_input", None)
     q=update.callback_query
     if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
     await q.answer(); settings=admin_get_settings()
     await q.edit_message_text(f"⚙️ SETTINGS\n━━━━━━━━━━━━━━━━\n\nStore: {settings.get('store_name','JanKug Store')}\nSupport: {settings.get('support_username','@JanKug')}\nReferral commission: {settings.get('referral_commission','5')}%\nReferral deposit limit: {settings.get('referral_deposit_limit','10')}\nUSD/BDT rate: 1 USD = {settings.get('usd_bdt_rate','127')} BDT",reply_markup=admin_settings_kb())
 
 async def admin_referrals(update,context):
+    context.user_data.pop("admin_input", None)
     q=update.callback_query
     if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
     await q.answer(); commission=get_setting("referral_commission","5"); limit=get_setting("referral_deposit_limit","10")
@@ -1066,6 +1084,7 @@ async def admin_referral_limit_prompt(update,context):
     context.user_data["admin_input"]={"kind":"referral_limit"}; await q.answer(); await q.edit_message_text("🔢 CHANGE DEPOSIT LIMIT\n\nSend how many first deposits qualify.\nExample: 10",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_referrals")]]))
 
 async def admin_rate(update,context):
+    context.user_data.pop("admin_input", None)
     q=update.callback_query
     if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
     await q.answer(); rate=get_setting("usd_bdt_rate","127")
@@ -1084,6 +1103,7 @@ def _payment_methods_admin_kb(methods):
     rows.append([InlineKeyboardButton("➕ Add Payment Method",callback_data="admin_payment_add")]); rows.append([InlineKeyboardButton("🔙 Settings",callback_data="admin_settings")]); return InlineKeyboardMarkup(rows)
 
 async def admin_payment_methods(update,context):
+    context.user_data.pop("admin_input", None)
     q=update.callback_query
     if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
     await q.answer(); await q.edit_message_text("💳 PAYMENT METHODS\n━━━━━━━━━━━━━━━━\n\nSelect a method to edit/toggle, or add a new one.",reply_markup=_payment_methods_admin_kb(admin_list_payment_methods(True)))
@@ -1097,6 +1117,7 @@ async def admin_payment_method_detail(update,context):
     await q.edit_message_text(f"💳 PAYMENT METHOD #{mid}\n━━━━━━━━━━━━━━━━\n\nName: {m['name']}\nType: {m['method_type']}\nCurrency: {m['currency']}\nRate: {rate:g}\nStatus: {status}\n\nDetails:\n{m['details'] or '(empty)'}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Edit",callback_data=f"admin_payment_edit:{mid}")],[InlineKeyboardButton("🔄 Enable / Disable",callback_data=f"admin_payment_toggle:{mid}")],[InlineKeyboardButton("🔙 Payment Methods",callback_data="admin_payment_methods")]]))
 
 async def admin_payment_add_prompt(update,context):
+    context.user_data.pop("admin_input", None)
     q=update.callback_query
     if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
     context.user_data["admin_input"]={"kind":"payment_add"}; await q.answer(); await q.edit_message_text("➕ ADD PAYMENT METHOD\n━━━━━━━━━━━━━━━━\n\nSend ONE line:\nName | type | currency | exchange_rate | details\n\nExamples:\nBinance Pay | binance_pay | USD | 1 | Binance Pay ID: 123456\nbKash | bkash | BDT | 127 | Number: 01XXXXXXXXX\nNagad | nagad | BDT | 127 | Number: 01XXXXXXXXX",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_payment_methods")]]))
