@@ -367,6 +367,38 @@ def complete_purchase(intent_id:int):
     finally: connection.close()
 
 
+
+def _apply_referral_commission_locked(cursor, payment_id:int, referred_user_db_id:int, deposit_amount:float):
+    """Apply one referral commission for a confirmed deposit, safely and idempotently."""
+    existing=cursor.execute("SELECT id FROM referral_commissions WHERE payment_id=? LIMIT 1",(payment_id,)).fetchone()
+    if existing:
+        return 0.0
+    referred=cursor.execute("SELECT referred_by FROM users WHERE id=?",(referred_user_db_id,)).fetchone()
+    if not referred or not referred["referred_by"]:
+        return 0.0
+    limit=int(float(get_setting("referral_deposit_limit","10") or 10))
+    commission_rate=float(get_setting("referral_commission","5") or 5)
+    if limit <= 0 or commission_rate <= 0:
+        return 0.0
+    deposit_number=int(cursor.execute("SELECT COUNT(*) FROM payments WHERE user_id=? AND status='paid'",(referred_user_db_id,)).fetchone()[0]) + 1
+    if deposit_number > limit:
+        return 0.0
+    amount=round(float(deposit_amount)*commission_rate/100.0,8)
+    if amount <= 0:
+        return 0.0
+    referrer=cursor.execute("SELECT id,balance,referral_income FROM users WHERE id=?",(referred["referred_by"],)).fetchone()
+    if not referrer:
+        return 0.0
+    before=float(referrer["balance"]); after=round(before+amount,8)
+    income=round(float(referrer["referral_income"] or 0)+amount,8)
+    cursor.execute("UPDATE users SET balance=?,referral_income=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(after,income,referrer["id"]))
+    cursor.execute("""INSERT INTO balance_transactions(user_id,transaction_type,amount,balance_before,balance_after,reference,description)
+                      VALUES(?,?,?,?,?,?,?)""",(referrer["id"],"referral_commission",amount,before,after,f"referral:{payment_id}",f"Referral commission from payment #{payment_id}"))
+    cursor.execute("""INSERT INTO referral_commissions(referrer_id,referred_user_id,payment_id,commission_rate,commission_amount,deposit_number)
+                      VALUES(?,?,?,?,?,?)""",(referrer["id"],referred_user_db_id,payment_id,commission_rate,amount,deposit_number))
+    return amount
+
+
 def confirm_payment(payment_id:int, admin_id:int):
     connection=get_connection(); cursor=connection.cursor()
     try:
@@ -384,12 +416,13 @@ def confirm_payment(payment_id:int, admin_id:int):
         cursor.execute("UPDATE users SET balance=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(after,user["id"]))
         cursor.execute("""INSERT INTO balance_transactions(user_id,transaction_type,amount,balance_before,balance_after,reference,description)
                           VALUES(?,?,?,?,?,?,?)""",(user["id"],"payment",amount,before,after,f"payment:{payment_id}",f"Payment #{payment_id} confirmed"))
+        referral_commission=_apply_referral_commission_locked(cursor,payment_id,user["id"],amount)
         cursor.execute("UPDATE payments SET status='paid',approved_at=CURRENT_TIMESTAMP,confirmed_at=CURRENT_TIMESTAMP,confirmed_by=? WHERE id=?",(admin_id,payment_id))
         intent_id=payment["purchase_intent_id"]; purchase=None
         if intent_id:
             cursor.execute("UPDATE purchase_intents SET status='ready',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending_payment'",(intent_id,))
             purchase=_complete_purchase_locked(cursor,intent_id,payment_id,admin_id)
-        connection.commit(); return {"payment_id":payment_id,"already_paid":False,"purchase":purchase}
+        connection.commit(); return {"payment_id":payment_id,"already_paid":False,"purchase":purchase,"referral_commission":referral_commission}
     except Exception:
         connection.rollback(); raise
     finally: connection.close()
@@ -851,4 +884,79 @@ def admin_remove_user(user_id, admin_telegram_id):
             if cur.execute(sql,args).fetchone(): raise ValueError(f"Customer has existing {name}; block the customer instead of deleting the account.")
         cur.execute("DELETE FROM users WHERE id=?",(user_id,)); cur.execute("INSERT INTO admin_logs(admin_telegram_id,action,target_type,target_id,details) VALUES(?,?,?,?,?)",(admin_telegram_id,"remove_user","user",user_id,f"telegram_id={row['telegram_id']}")); con.commit()
     except Exception: con.rollback(); raise
+    finally: con.close()
+
+
+# =========================
+# STAGE 5D — REFERRALS + SETTINGS + PAYMENT METHODS
+# =========================
+
+def admin_get_settings():
+    con=get_connection(); cur=con.cursor()
+    try:
+        rows=cur.execute("SELECT key,value FROM settings ORDER BY key").fetchall()
+        return {r["key"]: r["value"] for r in rows}
+    finally: con.close()
+
+
+def admin_list_payment_methods(include_inactive=True):
+    con=get_connection(); cur=con.cursor()
+    try:
+        if include_inactive:
+            return cur.execute("SELECT * FROM payment_methods ORDER BY sort_order,id").fetchall()
+        return cur.execute("SELECT * FROM payment_methods WHERE is_active=1 ORDER BY sort_order,id").fetchall()
+    finally: con.close()
+
+
+def admin_get_payment_method(method_id:int):
+    con=get_connection(); cur=con.cursor()
+    try:
+        return cur.execute("SELECT * FROM payment_methods WHERE id=?",(method_id,)).fetchone()
+    finally: con.close()
+
+
+def admin_create_payment_method(name:str, method_type:str, currency:str="USD", exchange_rate=None, details:str=""):
+    name=str(name or "").strip(); method_type=str(method_type or "").strip().lower(); currency=str(currency or "USD").strip().upper(); details=str(details or "").strip()
+    if not name: raise ValueError("Payment method name is required.")
+    if not method_type: raise ValueError("Payment method type is required.")
+    if currency not in {"USD","BDT"}: raise ValueError("Currency must be USD or BDT.")
+    rate=None if exchange_rate in (None,"") else float(exchange_rate)
+    if currency != "USD" and (rate is None or rate <= 0): raise ValueError("A positive exchange rate is required for local currency methods.")
+    if currency == "USD": rate=1.0
+    con=get_connection(); cur=con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        max_order=cur.execute("SELECT COALESCE(MAX(sort_order),0) FROM payment_methods").fetchone()[0]
+        cur.execute("""INSERT INTO payment_methods(name,method_type,details,currency,exchange_rate,is_active,sort_order)
+                       VALUES(?,?,?,?,?,1,?)""",(name,method_type,details,currency,rate,int(max_order)+1))
+        mid=cur.lastrowid; con.commit(); return mid
+    except Exception:
+        con.rollback(); raise
+    finally: con.close()
+
+
+def admin_update_payment_method(method_id:int, *, name=None, method_type=None, currency=None, exchange_rate=None, details=None, is_active=None):
+    con=get_connection(); cur=con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        row=cur.execute("SELECT * FROM payment_methods WHERE id=?",(method_id,)).fetchone()
+        if not row: raise ValueError("Payment method not found.")
+        vals=[]; sets=[]
+        if name is not None: sets.append("name=?"); vals.append(str(name).strip())
+        if method_type is not None: sets.append("method_type=?"); vals.append(str(method_type).strip().lower())
+        if currency is not None:
+            curcy=str(currency).strip().upper()
+            if curcy not in {"USD","BDT"}: raise ValueError("Currency must be USD or BDT.")
+            sets.append("currency=?"); vals.append(curcy)
+        if exchange_rate is not None:
+            rate=float(exchange_rate)
+            if rate<=0: raise ValueError("Exchange rate must be positive.")
+            sets.append("exchange_rate=?"); vals.append(rate)
+        if details is not None: sets.append("details=?"); vals.append(str(details))
+        if is_active is not None: sets.append("is_active=?"); vals.append(int(is_active))
+        if sets:
+            vals.append(method_id); cur.execute(f"UPDATE payment_methods SET {','.join(sets)} WHERE id=?",vals)
+        con.commit()
+    except Exception:
+        con.rollback(); raise
     finally: con.close()
