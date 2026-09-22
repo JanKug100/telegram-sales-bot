@@ -1,4 +1,6 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from io import BytesIO
+import csv
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
 
 from config import (
@@ -15,6 +17,7 @@ from db import (
     admin_dashboard_stats, admin_list_products, admin_get_product,
     admin_create_product, admin_update_product, admin_delete_product,
     admin_list_categories, admin_log,
+    admin_stock_summary, admin_stock_items, admin_add_stock, admin_remove_stock,
 )
 
 BOT_USERNAME = None
@@ -79,6 +82,76 @@ def format_delivery(contents):
     for i, content in enumerate(contents, 1):
         lines.append(f"\n#{i}\n{content}")
     return "\n".join(lines)
+
+
+def is_communication_product(purchase: dict) -> bool:
+    category = str(purchase.get("category_name") or "").lower()
+    product_type = str(purchase.get("product_type") or "").lower()
+    return category == "communication apps" or product_type == "communication"
+
+
+def build_csv_bytes(contents):
+    output = BytesIO()
+    text_buffer = []
+    # Build CSV as UTF-8 with BOM so common spreadsheet apps open it cleanly.
+    import io
+    string_io = io.StringIO()
+    writer = csv.writer(string_io, lineterminator="\n")
+    parsed_rows = []
+    max_fields = 1
+    for content in contents:
+        raw = str(content or "").strip()
+        if not raw:
+            parsed = [""]
+        elif "\t" in raw:
+            parsed = [x.strip() for x in raw.split("\t")]
+        elif "," in raw:
+            parsed = [x.strip() for x in raw.split(",")]
+        elif "|" in raw:
+            parsed = [x.strip() for x in raw.split("|")]
+        else:
+            parsed = [raw]
+        parsed_rows.append(parsed)
+        max_fields = max(max_fields, len(parsed))
+    headers = ["Email / Username", "Password"] if max_fields == 2 else [f"Field {i}" for i in range(1, max_fields + 1)]
+    writer.writerow(headers)
+    for row in parsed_rows:
+        writer.writerow(row + [""] * (max_fields - len(row)))
+    data = string_io.getvalue().encode("utf-8-sig")
+    output.write(data)
+    output.seek(0)
+    return output
+
+
+async def send_purchase_delivery(bot, purchase):
+    contents = purchase.get("delivered") or []
+    if not contents:
+        return
+    chat_id = purchase["telegram_id"]
+    if is_communication_product(purchase):
+        document = build_csv_bytes(contents)
+        filename = f"JanKug_{purchase['product_name'].replace(' ', '_')}_Order_{purchase['order_id']}.csv"
+        caption = (
+            "📦 COMMUNICATION APPS DELIVERY\n"
+            "━━━━━━━━━━━━━━━━\n\n"
+            f"🧾 Order: #{purchase['order_id']}\n"
+            f"📱 Product: {purchase['product_name']}\n"
+            f"🔢 Quantity: {purchase['quantity']}\n"
+            f"💰 Total: ${purchase['total']:.2f}\n\n"
+            "📄 Your stock is attached as a CSV file."
+        )
+        await bot.send_document(chat_id=chat_id, document=InputFile(document, filename=filename), caption=caption)
+    else:
+        text = (
+            "📦 VPN DELIVERY\n"
+            "━━━━━━━━━━━━━━━━\n\n"
+            f"🧾 Order: #{purchase['order_id']}\n"
+            f"🔐 Product: {purchase['product_name']}\n"
+            f"🔢 Quantity: {purchase['quantity']}\n"
+            f"💰 Total: ${purchase['total']:.2f}\n\n"
+            f"{format_delivery(contents)}"
+        )
+        await bot.send_message(chat_id=chat_id, text=text)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -313,7 +386,8 @@ async def confirm_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         intent=create_purchase_intent(update.effective_user.id,product["id"],quantity,0)
         result=complete_purchase(intent)
         await q.answer("Purchase completed!")
-        await q.edit_message_text(f"✅ PURCHASE COMPLETE\n━━━━━━━━━━━━━━━━\n\nOrder #{result['order_id']}\nProduct: {result['product_name']}\nQuantity: {result['quantity']}\nTotal: ${result['total']:.2f}\n\n💳 Remaining balance: ${result['balance_after']:.2f}\n\n{format_delivery(result['delivered'])}",reply_markup=back_main_keyboard())
+        await q.edit_message_text(f"✅ PURCHASE COMPLETE\n━━━━━━━━━━━━━━━━\n\nOrder #{result['order_id']}\nProduct: {result['product_name']}\nQuantity: {result['quantity']}\nTotal: ${result['total']:.2f}\n\n💳 Remaining balance: ${result['balance_after']:.2f}\n\n📦 Delivery is being sent...",reply_markup=back_main_keyboard())
+        await send_purchase_delivery(context.bot, result)
     except Exception as e:
         await q.answer(str(e),show_alert=True)
 
@@ -491,7 +565,8 @@ async def approve_payment_cmd(update,context):
         purchase=result.get("purchase")
         await update.message.reply_text(f"✅ Payment #{payment_id} confirmed." + (f"\nOrder #{purchase['order_id']} completed and delivered." if purchase else "\nBalance credited."))
         if purchase and not purchase.get("already_completed"):
-            await context.bot.send_message(purchase["telegram_id"],f"✅ PAYMENT CONFIRMED & ORDER COMPLETED\n━━━━━━━━━━━━━━━━\nPayment #{payment_id}\nOrder #{purchase['order_id']}\nProduct: {purchase['product_name']}\nQuantity: {purchase['quantity']}\nTotal: ${purchase['total']:.2f}\nRemaining balance: ${purchase['balance_after']:.2f}\n\n{format_delivery(purchase['delivered'])}",reply_markup=back_main_keyboard())
+            await context.bot.send_message(purchase["telegram_id"],f"✅ PAYMENT CONFIRMED & ORDER COMPLETED\n━━━━━━━━━━━━━━━━\nPayment #{payment_id}\nOrder #{purchase['order_id']}\nProduct: {purchase['product_name']}\nQuantity: {purchase['quantity']}\nTotal: ${purchase['total']:.2f}\nRemaining balance: ${purchase['balance_after']:.2f}\n\n📦 Delivery is being sent...",reply_markup=back_main_keyboard())
+            await send_purchase_delivery(context.bot, purchase)
         else:
             p=get_payment(payment_id); await context.bot.send_message(p["telegram_id"],f"✅ Payment #{payment_id} confirmed. Your balance has been credited.",reply_markup=main_menu_keyboard())
     except Exception as e: await update.message.reply_text(f"❌ Could not approve: {e}")
@@ -514,6 +589,7 @@ def admin_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Dashboard", callback_data="admin_dashboard")],
         [InlineKeyboardButton("🛍️ Products", callback_data="admin_products")],
+        [InlineKeyboardButton("📦 Stock Management", callback_data="admin_stock_menu")],
         [InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")],
     ])
 
@@ -840,6 +916,172 @@ async def admin_command_callback(update, context):
         reply_markup=admin_kb()
     )
 
+
+# =========================
+# STAGE 5B — STOCK MANAGEMENT
+# =========================
+
+
+def admin_stock_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Stock Overview", callback_data="admin_stock")],
+        [InlineKeyboardButton("➕ Add Stock", callback_data="admin_stock_add")],
+        [InlineKeyboardButton("🗑️ Remove Bad Stock", callback_data="admin_stock_remove")],
+        [InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel")],
+    ])
+
+
+async def admin_stock_menu(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True); return
+    await q.answer()
+    await q.edit_message_text("📦 STOCK MANAGEMENT\n━━━━━━━━━━━━━━━━\n\nChoose an option:", reply_markup=admin_stock_kb())
+
+
+async def admin_stock_overview(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True); return
+    await q.answer()
+    rows=admin_stock_summary()
+    lines=["📦 STOCK OVERVIEW","━━━━━━━━━━━━━━━━"]
+    if not rows:
+        lines.append("\nNo products found.")
+    else:
+        for r in rows:
+            status="🟢" if int(r["is_active"]) else "🔴"
+            lines.append(f"\n{status} {r['name']}\nAvailable: {r['available_stock']} | Sold: {r['sold_stock']}")
+    kb=[[InlineKeyboardButton("➕ Add Stock",callback_data="admin_stock_add")],
+        [InlineKeyboardButton("🗑️ Remove Bad Stock",callback_data="admin_stock_remove")],
+        [InlineKeyboardButton("🔙 Stock Management",callback_data="admin_stock_menu")]]
+    await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
+
+
+def stock_product_keyboard(products, action):
+    rows=[]
+    for p in products:
+        rows.append([InlineKeyboardButton(f"{p['name']} (available: {p['available_stock']})", callback_data=f"stock_{action}_product:{p['id']}")])
+    rows.append([InlineKeyboardButton("🔙 Stock Management",callback_data="admin_stock_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def admin_stock_add_menu(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True); return
+    await q.answer()
+    products=admin_list_products()
+    await q.edit_message_text("➕ ADD STOCK\n━━━━━━━━━━━━━━━━\n\nSelect the product:", reply_markup=stock_product_keyboard(products,"add"))
+
+
+async def admin_stock_add_product(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True); return
+    product_id=int(q.data.split(":",1)[1])
+    p=admin_get_product(product_id)
+    if not p: await q.answer("Product not found.",show_alert=True); return
+    context.user_data["admin_stock_input"]={"action":"add","product_id":product_id}
+    await q.answer()
+    await q.edit_message_text(
+        f"➕ ADD STOCK\n━━━━━━━━━━━━━━━━\n\nProduct: {p['name']}\n\n"
+        "Send stock items as separate lines.\n"
+        "For account stock, you can use: email,password\n"
+        "Example:\n"
+        "user1@example.com,password1\n"
+        "user2@example.com,password2\n\n"
+        "Each line becomes one stock item.\n"
+        "You can paste many lines at once.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_stock_menu")]])
+    )
+
+
+async def admin_stock_remove_menu(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True); return
+    await q.answer()
+    products=admin_list_products()
+    await q.edit_message_text("🗑️ REMOVE BAD STOCK\n━━━━━━━━━━━━━━━━\n\nSelect the product:", reply_markup=stock_product_keyboard(products,"remove"))
+
+
+async def admin_stock_remove_product(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True); return
+    product_id=int(q.data.split(":",1)[1])
+    p=admin_get_product(product_id)
+    if not p: await q.answer("Product not found.",show_alert=True); return
+    items=admin_stock_items(product_id,"available",50)
+    if not items:
+        await q.answer("No available stock.",show_alert=True); return
+    rows=[]
+    for item in items:
+        content=str(item["stock_content"])
+        preview=content.replace("\n"," ")[:45]
+        rows.append([InlineKeyboardButton(f"#{item['id']} {preview}",callback_data=f"admin_stock_remove_item:{item['id']}")])
+    rows.append([InlineKeyboardButton("🔙 Back",callback_data="admin_stock_remove")])
+    await q.answer()
+    await q.edit_message_text(f"🗑️ REMOVE BAD STOCK\n━━━━━━━━━━━━━━━━\n\nProduct: {p['name']}\n\nSelect the stock item to remove:",reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def admin_stock_remove_item(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.",show_alert=True); return
+    stock_id=int(q.data.split(":",1)[1])
+    item=admin_stock_items(None,"available",1,stock_id=stock_id)
+    if not item:
+        await q.answer("Stock item not found.",show_alert=True); return
+    row=item[0]
+    await q.answer()
+    await q.edit_message_text(
+        f"⚠️ REMOVE STOCK ITEM\n━━━━━━━━━━━━━━━━\n\nStock ID: #{row['id']}\nProduct: {row['product_name']}\n\n{row['stock_content']}\n\nRemove this item?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, Remove",callback_data=f"admin_stock_remove_confirm:{stock_id}")],
+            [InlineKeyboardButton("❌ Cancel",callback_data=f"stock_remove_product:{row['product_id']}")]
+        ])
+    )
+
+
+async def admin_stock_remove_confirm(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.",show_alert=True); return
+    stock_id=int(q.data.split(":",1)[1])
+    result=admin_remove_stock(stock_id,update.effective_user.id)
+    await q.answer(result,show_alert=True)
+    await admin_stock_menu(update,context)
+
+
+async def admin_stock_input_handler(update, context):
+    state=context.user_data.get("admin_stock_input")
+    if not state or not update.message or not update.message.text:
+        return False
+    if not await admin_only(update):
+        context.user_data.pop("admin_stock_input",None); return False
+    raw=update.message.text.strip()
+    if raw.lower() in {"cancel","/cancel"}:
+        context.user_data.pop("admin_stock_input",None)
+        await update.message.reply_text("❌ Stock operation cancelled.",reply_markup=admin_kb()); return True
+    if state["action"]!="add": return False
+    lines=[x.strip() for x in raw.splitlines() if x.strip()]
+    if not lines:
+        await update.message.reply_text("❌ No stock items found. Paste one stock item per line."); return True
+    if len(lines)>500:
+        await update.message.reply_text("❌ Maximum 500 stock items per upload. Split the stock into smaller batches."); return True
+    try:
+        added=admin_add_stock(state["product_id"],lines,update.effective_user.id)
+        context.user_data.pop("admin_stock_input",None)
+        await update.message.reply_text(f"✅ Stock added successfully.\n\nAdded: {added} item(s).",reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📦 Stock Overview",callback_data="admin_stock")],
+            [InlineKeyboardButton("🔐 Admin Panel",callback_data="admin_panel")]
+        ]))
+    except Exception as e:
+        await update.message.reply_text(f"❌ {e}")
+    return True
+
 async def error_handler(update,context): print("Bot error:",context.error)
 
 
@@ -865,6 +1107,14 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_delete_product_prompt,pattern="^admin_delete:"))
     application.add_handler(CallbackQueryHandler(admin_delete_product_confirm,pattern="^admin_delete_confirm:"))
     application.add_handler(CallbackQueryHandler(admin_add_product_prompt,pattern="^admin_add_product$"))
+    application.add_handler(CallbackQueryHandler(admin_stock_menu,pattern="^admin_stock_menu$"))
+    application.add_handler(CallbackQueryHandler(admin_stock_overview,pattern="^admin_stock$"))
+    application.add_handler(CallbackQueryHandler(admin_stock_add_menu,pattern="^admin_stock_add$"))
+    application.add_handler(CallbackQueryHandler(admin_stock_add_product,pattern="^stock_add_product:"))
+    application.add_handler(CallbackQueryHandler(admin_stock_remove_menu,pattern="^admin_stock_remove$"))
+    application.add_handler(CallbackQueryHandler(admin_stock_remove_product,pattern="^stock_remove_product:"))
+    application.add_handler(CallbackQueryHandler(admin_stock_remove_item,pattern="^admin_stock_remove_item:"))
+    application.add_handler(CallbackQueryHandler(admin_stock_remove_confirm,pattern="^admin_stock_remove_confirm:"))
 
     application.add_handler(CallbackQueryHandler(show_main_menu,pattern="^main_menu$"))
     application.add_handler(CallbackQueryHandler(show_profile,pattern="^my_profile$"))
@@ -902,6 +1152,7 @@ def main():
 
     # Text handler first checks active payment/amount states.
     async def text_router(update,context):
+        if await admin_stock_input_handler(update,context): return
         if await admin_input_handler(update,context): return
         if await process_custom_quantity(update,context): return
         if await add_balance_text_handler(update,context): return
