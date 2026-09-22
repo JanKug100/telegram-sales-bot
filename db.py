@@ -49,6 +49,11 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL, stock_content TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'available', order_id INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             sold_at TIMESTAMP, FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE)""")
+        cursor.execute("""CREATE TABLE IF NOT EXISTS product_stock_fields (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL, field_name TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(product_id, field_name),
+            FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE)""")
         cursor.execute("""CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, product_id INTEGER NOT NULL,
             quantity INTEGER NOT NULL DEFAULT 1, unit_price REAL NOT NULL DEFAULT 0.0,
@@ -154,6 +159,16 @@ def init_db():
             if not cursor.fetchone():
                 cursor.execute("""INSERT INTO products(category_id,product_key,name,price,product_type,validity_days)
                                   VALUES(?,?,?,?,?,?)""", (category_id,key,name,price,"stock",validity))
+
+        # Existing Communication Apps products get the same sensible default fields
+        # used by the current Add Stock screen. Admins can change these anytime.
+        comm_products = cursor.execute("SELECT id FROM products WHERE category_id=?", (comm_id,)).fetchall()
+        default_fields = ["Email / Username", "Password"]
+        for product_row in comm_products:
+            product_id = int(product_row["id"])
+            for order, field_name in enumerate(default_fields, 1):
+                cursor.execute("""INSERT OR IGNORE INTO product_stock_fields(product_id,field_name,sort_order)
+                                  VALUES(?,?,?)""", (product_id, field_name, order))
 
         cursor.execute("SELECT id FROM payment_methods WHERE method_type='binance_pay'")
         if not cursor.fetchone():
@@ -340,7 +355,7 @@ def _complete_purchase_locked(cursor, intent_id:int, payment_id:Optional[int]=No
         delivered.append(item["stock_content"])
     cursor.execute("UPDATE purchase_intents SET status='completed',order_id=?,updated_at=CURRENT_TIMESTAMP,completed_at=CURRENT_TIMESTAMP WHERE id=?",(order_id,intent_id))
     return {"already_completed":False,"order_id":order_id,"telegram_id":intent["telegram_id"],"delivered":delivered,"total":total,"balance_after":after,"product_name":intent["name"],"quantity":quantity,
-            "product_type":intent["product_type"],"category_name":intent["category_name"]}
+            "product_id":int(intent["product_id"]),"product_type":intent["product_type"],"category_name":intent["category_name"]}
 
 
 def complete_purchase(intent_id:int):
@@ -476,6 +491,11 @@ def admin_create_product(category_id:int, product_key:str, name:str, price:float
                        VALUES(?,?,?,?,?,?,?,1)""",
                     (category_id,product_key,name,description,float(price),product_type,validity_days))
         pid=cur.lastrowid
+        category_name=cur.execute("SELECT name FROM categories WHERE id=?",(category_id,)).fetchone()
+        if category_name and str(category_name["name"]).lower()=="communication apps":
+            for order, field_name in enumerate(("Email / Username", "Password"), 1):
+                cur.execute("INSERT OR IGNORE INTO product_stock_fields(product_id,field_name,sort_order) VALUES(?,?,?)",
+                            (pid, field_name, order))
         con.commit(); return pid
     except Exception:
         con.rollback(); raise
@@ -545,6 +565,78 @@ def database_health_check() -> bool:
 # =========================
 # STAGE 5B STOCK HELPERS
 # =========================
+
+def admin_get_stock_fields(product_id=None, field_id=None):
+    con=get_connection(); cur=con.cursor()
+    try:
+        if field_id is not None:
+            return cur.execute("""SELECT * FROM product_stock_fields WHERE id=?""",(field_id,)).fetchall()
+        return cur.execute("""SELECT * FROM product_stock_fields WHERE product_id=? ORDER BY sort_order,id""",(product_id,)).fetchall()
+    finally:
+        con.close()
+
+
+def admin_add_stock_field(product_id:int, field_name:str, admin_telegram_id:int):
+    name=str(field_name or "").strip()
+    if not name: raise ValueError("Field name cannot be empty.")
+    if len(name)>50: raise ValueError("Field name must be 1-50 characters.")
+    con=get_connection(); cur=con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        if not cur.execute("SELECT id FROM products WHERE id=?",(product_id,)).fetchone():
+            raise ValueError("Product not found.")
+        exists=cur.execute("SELECT id FROM product_stock_fields WHERE product_id=? AND lower(field_name)=lower(?)",(product_id,name)).fetchone()
+        if exists: raise ValueError("A field with this name already exists for this product.")
+        max_order=cur.execute("SELECT COALESCE(MAX(sort_order),0) FROM product_stock_fields WHERE product_id=?",(product_id,)).fetchone()[0]
+        cur.execute("INSERT INTO product_stock_fields(product_id,field_name,sort_order) VALUES(?,?,?)",(product_id,name,int(max_order)+1))
+        field_id=cur.lastrowid
+        cur.execute("INSERT INTO admin_logs(admin_telegram_id,action,target_type,target_id,details) VALUES(?,?,?,?,?)",
+                    (admin_telegram_id,"add_stock_field","stock_field",field_id,f"product={product_id}; name={name}"))
+        con.commit(); return field_id
+    except Exception:
+        con.rollback(); raise
+    finally:
+        con.close()
+
+
+def admin_rename_stock_field(field_id:int, field_name:str, admin_telegram_id:int):
+    name=str(field_name or "").strip()
+    if not name: raise ValueError("Field name cannot be empty.")
+    if len(name)>50: raise ValueError("Field name must be 1-50 characters.")
+    con=get_connection(); cur=con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        row=cur.execute("SELECT * FROM product_stock_fields WHERE id=?",(field_id,)).fetchone()
+        if not row: raise ValueError("Field not found.")
+        exists=cur.execute("SELECT id FROM product_stock_fields WHERE product_id=? AND lower(field_name)=lower(?) AND id<>?",(row["product_id"],name,field_id)).fetchone()
+        if exists: raise ValueError("A field with this name already exists for this product.")
+        cur.execute("UPDATE product_stock_fields SET field_name=? WHERE id=?",(name,field_id))
+        cur.execute("INSERT INTO admin_logs(admin_telegram_id,action,target_type,target_id,details) VALUES(?,?,?,?,?)",
+                    (admin_telegram_id,"rename_stock_field","stock_field",field_id,f"name={name}"))
+        con.commit()
+    except Exception:
+        con.rollback(); raise
+    finally:
+        con.close()
+
+
+def admin_remove_stock_field(field_id:int):
+    con=get_connection(); cur=con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        row=cur.execute("SELECT id,product_id FROM product_stock_fields WHERE id=?",(field_id,)).fetchone()
+        if not row: raise ValueError("Field not found.")
+        cur.execute("DELETE FROM product_stock_fields WHERE id=?",(field_id,))
+        # Keep the remaining field order clean.
+        remaining=cur.execute("SELECT id FROM product_stock_fields WHERE product_id=? ORDER BY sort_order,id",(row["product_id"],)).fetchall()
+        for order,item in enumerate(remaining,1):
+            cur.execute("UPDATE product_stock_fields SET sort_order=? WHERE id=?",(order,item["id"]))
+        con.commit()
+    except Exception:
+        con.rollback(); raise
+    finally:
+        con.close()
+
 
 def admin_stock_summary():
     con=get_connection(); cur=con.cursor()
