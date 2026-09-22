@@ -90,37 +90,25 @@ def is_communication_product(purchase: dict) -> bool:
     return category == "communication apps" or product_type == "communication"
 
 
+def _parse_communication_stock_row(content):
+    raw = str(content or '').strip()
+    if not raw: return ['']
+    if '\t' in raw: return [x.strip() for x in raw.split('\t')]
+    if '|' in raw: return [x.strip() for x in raw.split('|')]
+    if ',' in raw: return [x.strip() for x in raw.split(',')]
+    return [raw]
+
 def build_csv_bytes(contents):
-    output = BytesIO()
-    text_buffer = []
-    # Build CSV as UTF-8 with BOM so common spreadsheet apps open it cleanly.
-    import io
-    string_io = io.StringIO()
-    writer = csv.writer(string_io, lineterminator="\n")
-    parsed_rows = []
-    max_fields = 1
-    for content in contents:
-        raw = str(content or "").strip()
-        if not raw:
-            parsed = [""]
-        elif "\t" in raw:
-            parsed = [x.strip() for x in raw.split("\t")]
-        elif "," in raw:
-            parsed = [x.strip() for x in raw.split(",")]
-        elif "|" in raw:
-            parsed = [x.strip() for x in raw.split("|")]
-        else:
-            parsed = [raw]
-        parsed_rows.append(parsed)
-        max_fields = max(max_fields, len(parsed))
-    headers = ["Email / Username", "Password"] if max_fields == 2 else [f"Field {i}" for i in range(1, max_fields + 1)]
+    rows = [_parse_communication_stock_row(x) for x in (contents or [])] or [['']]
+    max_fields = max(len(x) for x in rows)
+    if max_fields == 1: headers=['Stock']
+    elif max_fields == 2: headers=['Email / Username','Password']
+    else: headers=['Field 1','Field 2'] + [f'Field {i}' for i in range(3,max_fields+1)]
+    string_io=io.StringIO()
+    writer=csv.writer(string_io,lineterminator='\n')
     writer.writerow(headers)
-    for row in parsed_rows:
-        writer.writerow(row + [""] * (max_fields - len(row)))
-    data = string_io.getvalue().encode("utf-8-sig")
-    output.write(data)
-    output.seek(0)
-    return output
+    for row in rows: writer.writerow(row + ['']*(max_fields-len(row)))
+    return BytesIO(string_io.getvalue().encode('utf-8-sig'))
 
 
 async def send_purchase_delivery(bot, purchase):
@@ -138,7 +126,7 @@ async def send_purchase_delivery(bot, purchase):
             f"📱 Product: {purchase['product_name']}\n"
             f"🔢 Quantity: {purchase['quantity']}\n"
             f"💰 Total: ${purchase['total']:.2f}\n\n"
-            "📄 Your stock is attached as a CSV file."
+            "📄 All purchased stock is included in this ONE CSV file."
         )
         await bot.send_document(chat_id=chat_id, document=InputFile(document, filename=filename), caption=caption)
     else:
@@ -1160,7 +1148,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_router))
     application.add_error_handler(error_handler)
 
-    print(f"{STORE_NAME} Stage 5A bot is running...")
+    print(f"{STORE_NAME} Stage 5B bot is running...")
     application.run_polling()
 
 if __name__ == "__main__": main()
