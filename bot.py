@@ -1,1154 +1,609 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-from io import BytesIO
-import csv
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
+import sqlite3
+from typing import Optional, Any
 
-from config import (
-    BOT_TOKEN, SUPPORT_USERNAME, STORE_NAME,
-    DEFAULT_REFERRAL_COMMISSION, DEFAULT_REFERRAL_DEPOSIT_LIMIT,
-    ADMIN_IDS,
-)
-
-from db import (
-    init_db, get_user, create_user, update_user, get_balance, get_setting,
-    get_product_by_key, get_available_stock_count, create_purchase_intent,
-    complete_purchase, create_payment, get_payment, submit_payment_reference,
-    confirm_payment, cancel_payment, get_recent_orders, get_order_items,
-    admin_dashboard_stats, admin_list_products, admin_get_product,
-    admin_create_product, admin_update_product, admin_delete_product,
-    admin_list_categories, admin_log,
-    admin_stock_summary, admin_stock_items, admin_add_stock, admin_remove_stock,
-)
-
-BOT_USERNAME = None
+DATABASE_FILE = "sales_bot.db"
 
 
-def ensure_user(update: Update):
-    user = update.effective_user
-    if not user:
-        return None
-    existing = get_user(user.id)
-    if not existing:
-        create_user(user.id, user.username, user.first_name, user.last_name)
-    else:
-        update_user(user.id, user.username, user.first_name, user.last_name)
-    return get_user(user.id)
+def get_connection():
+    connection = sqlite3.connect(DATABASE_FILE, timeout=30, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 30000")
+    return connection
 
 
-def main_menu_keyboard(user_id=None):
-    rows = [
-        [InlineKeyboardButton("📱 Communication Apps", callback_data="communication_apps"), InlineKeyboardButton("🔐 BUY VPN", callback_data="buy_vpn")],
-        [InlineKeyboardButton("🧑‍💻 Verification Services", callback_data="verification_service"), InlineKeyboardButton("🌐 BUY Proxy", callback_data="buy_proxy")],
-        [InlineKeyboardButton("🧑‍💼 My Profile", callback_data="my_profile"), InlineKeyboardButton("🛍️ Buy More Products", callback_data="buy_more_products")],
-        [InlineKeyboardButton("💰 Add Balance", callback_data="add_balance"), InlineKeyboardButton("📦 My Orders", callback_data="my_orders")],
-        [InlineKeyboardButton("👥 Refer", callback_data="refer"), InlineKeyboardButton("🎧 Support", callback_data="support")],
-    ]
-    if user_id in ADMIN_IDS:
-        rows.append([InlineKeyboardButton("🔐 Admin Panel", callback_data="admin_panel")])
-    return InlineKeyboardMarkup(rows)
+def _column_exists(cursor, table: str, column: str) -> bool:
+    cursor.execute(f"PRAGMA table_info({table})")
+    return any(row["name"] == column for row in cursor.fetchall())
 
 
-def back_main_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+def _add_column_if_missing(cursor, table: str, definition: str, column: str):
+    if not _column_exists(cursor, table, column):
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
 
-def product_key_from_callback(data: str) -> str:
-    if data.startswith("product_"):
-        return data[len("product_"):]
-    if data.startswith("vpn_product_"):
-        return data[len("vpn_product_"):]
-    return data
-
-
-def product_purchase_keyboard(product_key: str, stock_count: int):
-    # Preset quantities are convenient, while Custom Quantity lets the
-    # customer enter any positive whole number up to the available stock.
-    rows = [
-        [InlineKeyboardButton("1", callback_data=f"buyqty:{product_key}:1"),
-         InlineKeyboardButton("2", callback_data=f"buyqty:{product_key}:2"),
-         InlineKeyboardButton("3", callback_data=f"buyqty:{product_key}:3")],
-        [InlineKeyboardButton("5", callback_data=f"buyqty:{product_key}:5"),
-         InlineKeyboardButton("10", callback_data=f"buyqty:{product_key}:10")],
-        [InlineKeyboardButton("✏️ Custom Quantity", callback_data=f"customqty:{product_key}")],
-        [InlineKeyboardButton("🔙 Back", callback_data="communication_apps" if product_key in {"gv_old","gv_new","tn_web","tn_phone","tf_web","tf_phone","sl_web","sl_phone","talkatone","textplus"} else "buy_vpn")],
-    ]
-    return InlineKeyboardMarkup(rows)
-
-
-def format_delivery(contents):
-    if not contents:
-        return "No delivery content was found. Please contact support."
-    lines = ["📦 DELIVERY", "━━━━━━━━━━━━━━━━"]
-    for i, content in enumerate(contents, 1):
-        lines.append(f"\n#{i}\n{content}")
-    return "\n".join(lines)
-
-
-def is_communication_product(purchase: dict) -> bool:
-    category = str(purchase.get("category_name") or "").lower()
-    product_type = str(purchase.get("product_type") or "").lower()
-    return category == "communication apps" or product_type == "communication"
-
-
-def _parse_communication_stock_row(content):
-    raw = str(content or '').strip()
-    if not raw: return ['']
-    if '\t' in raw: return [x.strip() for x in raw.split('\t')]
-    if '|' in raw: return [x.strip() for x in raw.split('|')]
-    if ',' in raw: return [x.strip() for x in raw.split(',')]
-    return [raw]
-
-def build_csv_bytes(contents):
-    rows = [_parse_communication_stock_row(x) for x in (contents or [])] or [['']]
-    max_fields = max(len(x) for x in rows)
-    if max_fields == 1: headers=['Stock']
-    elif max_fields == 2: headers=['Email / Username','Password']
-    else: headers=['Field 1','Field 2'] + [f'Field {i}' for i in range(3,max_fields+1)]
-    string_io=io.StringIO()
-    writer=csv.writer(string_io,lineterminator='\n')
-    writer.writerow(headers)
-    for row in rows: writer.writerow(row + ['']*(max_fields-len(row)))
-    return BytesIO(string_io.getvalue().encode('utf-8-sig'))
-
-
-async def send_purchase_delivery(bot, purchase):
-    contents = purchase.get("delivered") or []
-    if not contents:
-        return
-    chat_id = purchase["telegram_id"]
-    if is_communication_product(purchase):
-        document = build_csv_bytes(contents)
-        filename = f"JanKug_{purchase['product_name'].replace(' ', '_')}_Order_{purchase['order_id']}.csv"
-        caption = (
-            "📦 COMMUNICATION APPS DELIVERY\n"
-            "━━━━━━━━━━━━━━━━\n\n"
-            f"🧾 Order: #{purchase['order_id']}\n"
-            f"📱 Product: {purchase['product_name']}\n"
-            f"🔢 Quantity: {purchase['quantity']}\n"
-            f"💰 Total: ${purchase['total']:.2f}\n\n"
-            "📄 All purchased stock is included in this ONE CSV file."
-        )
-        await bot.send_document(chat_id=chat_id, document=InputFile(document, filename=filename), caption=caption)
-    else:
-        text = (
-            "📦 VPN DELIVERY\n"
-            "━━━━━━━━━━━━━━━━\n\n"
-            f"🧾 Order: #{purchase['order_id']}\n"
-            f"🔐 Product: {purchase['product_name']}\n"
-            f"🔢 Quantity: {purchase['quantity']}\n"
-            f"💰 Total: ${purchase['total']:.2f}\n\n"
-            f"{format_delivery(contents)}"
-        )
-        await bot.send_message(chat_id=chat_id, text=text)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not update.message:
-        return
-    referred_by = None
-    if context.args and context.args[0].startswith("ref_"):
-        raw = context.args[0][4:]
-        if raw.isdigit():
-            ref_user = get_user(int(raw))
-            if ref_user and ref_user["telegram_id"] != user.id:
-                referred_by = ref_user["id"]
-
-    existing = get_user(user.id)
-    if not existing:
-        create_user(user.id, user.username, user.first_name, user.last_name, referred_by)
-    else:
-        update_user(user.id, user.username, user.first_name, user.last_name)
-
-    await update.message.reply_text(
-        f"🏠 {STORE_NAME}\n━━━━━━━━━━━━━━━━\n\nWelcome to the store!\n\nChoose an option below.",
-        reply_markup=main_menu_keyboard()
-    )
-
-
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query; await q.answer()
-    await q.edit_message_text(f"🏠 {STORE_NAME}\n━━━━━━━━━━━━━━━━\n\nChoose an option below.", reply_markup=main_menu_keyboard())
-
-
-async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query; await q.answer(); user=update.effective_user; ensure_user(update)
-    balance=get_balance(user.id); username=f"@{user.username}" if user.username else "@N/A"
-    referral_link=f"https://t.me/{context.bot.username}?start=ref_{user.id}" if context.bot.username else "Referral link unavailable"
-    db_user=get_user(user.id); total_refs=int(db_user["total_referrals"]) if db_user else 0; ref_income=float(db_user["referral_income"]) if db_user else 0
-    commission=get_setting("referral_commission", str(DEFAULT_REFERRAL_COMMISSION)); limit=get_setting("referral_deposit_limit", str(DEFAULT_REFERRAL_DEPOSIT_LIMIT))
-    text=(f"👤 ACCOUNT DASHBOARD\n━━━━━━━━━━━━━━━━\n🏷 Name: {user.full_name}\n🔰 Username: {username}\n🆔 User ID: {user.id}\n━━━━━━━━━━━━━━━━\n💳 Balance: ${balance:.2f}\n🎯 Referral Link:\n{referral_link}\n\n💰 Refer {commission}% commission\n📌 First {limit} deposits\n\n📊 Total Refs: {total_refs}\n🎁 Ref Income: ${ref_income:.2f}")
-    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Refer", callback_data="refer")],[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]))
-
-
-async def communication_apps(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query; await q.answer()
-    kb=[[InlineKeyboardButton("Google Voice",callback_data="google_voice"),InlineKeyboardButton("TextNow",callback_data="textnow")],[InlineKeyboardButton("TextFree",callback_data="textfree"),InlineKeyboardButton("Sideline",callback_data="sideline")],[InlineKeyboardButton("Talkatone",callback_data="talkatone"),InlineKeyboardButton("TextPlus",callback_data="textplus")],[InlineKeyboardButton("🏠 Main Menu",callback_data="main_menu")]]
-    await q.edit_message_text("💬 COMMUNICATION APPS\n━━━━━━━━━━━━━━━━\n\nSelect a product:",reply_markup=InlineKeyboardMarkup(kb))
-
-
-def simple_two_product_screen(title, products, back="communication_apps"):
-    # products is a flat list of (button_text, callback_data) pairs.
-    # Keep the two products on one row.
-    kb=[]
-    for i in range(0, len(products), 2):
-        row=[]
-        for label, callback in products[i:i+2]:
-            row.append(InlineKeyboardButton(label, callback_data=callback))
-        kb.append(row)
-    kb.append([InlineKeyboardButton("🔙 Back", callback_data=back)])
-    return InlineKeyboardMarkup(kb)
-
-
-async def google_voice(update, context):
-    q=update.callback_query; await q.answer(); await q.edit_message_text("📱 GOOGLE VOICE\n━━━━━━━━━━━━━━━━\n\nChoose product:",reply_markup=simple_two_product_screen("",[("Old GV","product_gv_old"),("New GV","product_gv_new")]))
-
-async def textnow(update, context):
-    q=update.callback_query; await q.answer(); await q.edit_message_text("📱 TEXTNOW\n━━━━━━━━━━━━━━━━\n\nChoose product:",reply_markup=simple_two_product_screen("",[("Web TN","product_tn_web"),("Phone TN","product_tn_phone")]))
-
-async def textfree(update, context):
-    q=update.callback_query; await q.answer(); await q.edit_message_text("📱 TEXTFREE\n━━━━━━━━━━━━━━━━\n\nChoose product:",reply_markup=simple_two_product_screen("",[("Web TF","product_tf_web"),("Phone TF","product_tf_phone")]))
-
-async def sideline(update, context):
-    q=update.callback_query; await q.answer(); await q.edit_message_text("📱 SIDELINE\n━━━━━━━━━━━━━━━━\n\nChoose product:",reply_markup=simple_two_product_screen("",[("Web SL","product_sl_web"),("Phone SL","product_sl_phone")]))
-
-
-async def show_product_for_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE, product_key: str):
-    q=update.callback_query
-    product=get_product_by_key(product_key)
-    if not product:
-        await q.answer("Product is not configured.", show_alert=True); return
-    if not int(product["is_active"]):
-        await q.answer("This product is currently unavailable.", show_alert=True); return
-    stock=get_available_stock_count(product["id"])
-    if stock < 1:
-        await q.answer("Out of stock.", show_alert=True)
-        await q.edit_message_text(f"🛍️ {product['name']}\n━━━━━━━━━━━━━━━━\n\n❌ Out of stock.\n\nPlease contact {SUPPORT_USERNAME} to ask about stock.", reply_markup=product_purchase_keyboard(product_key,0))
-        return
-    await q.answer()
-    await q.edit_message_text(f"🛍️ {product['name']}\n━━━━━━━━━━━━━━━━\n\n💰 Price: ${float(product['price']):.2f}\n📦 Available: {stock}\n\nSelect quantity:", reply_markup=product_purchase_keyboard(product_key,stock))
-
-
-async def talkatone(update, context): await show_product_for_purchase(update,context,"talkatone")
-async def textplus(update, context): await show_product_for_purchase(update,context,"textplus")
-async def communication_product(update, context): await show_product_for_purchase(update,context,product_key_from_callback(update.callback_query.data))
-async def vpn_product(update, context): await show_product_for_purchase(update,context,product_key_from_callback(update.callback_query.data))
-
-
-async def custom_quantity_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    product_key = q.data.split(":", 1)[1]
-    product = get_product_by_key(product_key)
-    if not product or not int(product["is_active"]):
-        await q.answer("This product is unavailable.", show_alert=True)
-        return
-
-    stock = get_available_stock_count(product["id"])
-    if stock < 1:
-        await q.answer("Out of stock.", show_alert=True)
-        return
-
-    # Store only the current customer's pending custom-quantity request.
-    context.user_data["awaiting_custom_quantity"] = product_key
-    await q.answer()
-    await q.edit_message_text(
-        f"✏️ CUSTOM QUANTITY\n━━━━━━━━━━━━━━━━\n\n"
-        f"Product: {product['name']}\n"
-        f"Price: ${float(product['price']):.2f} each\n"
-        f"Available stock: {stock}\n\n"
-        f"Please type the quantity you want to buy.\n"
-        f"Example: 25\n\n"
-        f"Enter a whole number from 1 to {stock}.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancelcustomqty:{product_key}")]])
-    )
-
-
-async def cancel_custom_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    product_key = q.data.split(":", 1)[1]
-    context.user_data.pop("awaiting_custom_quantity", None)
-    await q.answer("Cancelled.")
-    await show_product_for_purchase(update, context, product_key)
-
-
-async def process_custom_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    product_key = context.user_data.get("awaiting_custom_quantity")
-    if not product_key or not update.message or not update.message.text:
-        return False
-
-    raw = update.message.text.strip()
-    if not raw.isdigit():
-        await update.message.reply_text(
-            "❌ Invalid quantity.\n\nPlease enter a whole number only, for example: 25.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancelcustomqty:{product_key}")]])
-        )
-        return True
-
-    quantity = int(raw)
-    if quantity < 1:
-        await update.message.reply_text("❌ Quantity must be at least 1.")
-        return True
-
-    product = get_product_by_key(product_key)
-    if not product or not int(product["is_active"]):
-        context.user_data.pop("awaiting_custom_quantity", None)
-        await update.message.reply_text("❌ This product is no longer available.", reply_markup=main_menu_keyboard())
-        return True
-
-    stock = get_available_stock_count(product["id"])
-    if quantity > stock:
-        await update.message.reply_text(
-            f"❌ Not enough stock.\n\nAvailable: {stock}\nYou requested: {quantity}\n\nPlease enter a quantity from 1 to {stock}.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancelcustomqty:{product_key}")]])
-        )
-        return True
-
-    context.user_data.pop("awaiting_custom_quantity", None)
-    total = round(float(product["price"]) * quantity, 2)
-    balance = get_balance(update.effective_user.id)
-
-    if balance + 1e-9 >= total:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"✅ Buy {quantity} for ${total:.2f}", callback_data=f"confirmbuy:{product_key}:{quantity}")],
-            [InlineKeyboardButton("🔙 Back", callback_data=f"product_{product_key}")]
-        ])
-        await update.message.reply_text(
-            f"🛒 ORDER SUMMARY\n━━━━━━━━━━━━━━━━\n\n"
-            f"Product: {product['name']}\n"
-            f"Quantity: {quantity}\n"
-            f"Unit price: ${float(product['price']):.2f}\n"
-            f"Total: ${total:.2f}\n\n"
-            f"💳 Your balance: ${balance:.2f}\n\n"
-            f"Your balance is sufficient.",
-            reply_markup=kb
-        )
-    else:
-        required = round(total - balance, 2)
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"💰 Pay ${required:.2f} & Continue", callback_data=f"paypurchase:{product_key}:{quantity}")],
-            [InlineKeyboardButton("🔙 Back", callback_data=f"product_{product_key}")]
-        ])
-        await update.message.reply_text(
-            f"🛒 ORDER SUMMARY\n━━━━━━━━━━━━━━━━\n\n"
-            f"Product: {product['name']}\n"
-            f"Quantity: {quantity}\n"
-            f"Total: ${total:.2f}\n\n"
-            f"💳 Current balance: ${balance:.2f}\n"
-            f"❗ Additional payment required: ${required:.2f}\n\n"
-            f"After payment is confirmed, the purchase will continue automatically.",
-            reply_markup=kb
-        )
-    return True
-
-
-async def quantity_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query
+def init_db():
+    connection = get_connection()
+    cursor = connection.cursor()
     try:
-        _, product_key, qty_raw=q.data.split(":",2); quantity=int(qty_raw)
+        cursor.execute("BEGIN")
+        cursor.execute("""CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id INTEGER UNIQUE NOT NULL,
+            username TEXT, first_name TEXT, last_name TEXT, balance REAL NOT NULL DEFAULT 0.0,
+            is_blocked INTEGER NOT NULL DEFAULT 0, referral_code TEXT UNIQUE, referred_by INTEGER,
+            total_referrals INTEGER NOT NULL DEFAULT 0, referral_income REAL NOT NULL DEFAULT 0.0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (referred_by) REFERENCES users(id))""")
+        cursor.execute("""CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT, emoji TEXT,
+            sort_order INTEGER NOT NULL DEFAULT 0, is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        cursor.execute("""CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, category_id INTEGER, product_key TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL, description TEXT, price REAL NOT NULL DEFAULT 0.0,
+            product_type TEXT NOT NULL DEFAULT 'stock', validity_days INTEGER,
+            is_active INTEGER NOT NULL DEFAULT 1, sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL)""")
+        cursor.execute("""CREATE TABLE IF NOT EXISTS stock (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL, stock_content TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'available', order_id INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            sold_at TIMESTAMP, FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE)""")
+        cursor.execute("""CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, product_id INTEGER NOT NULL,
+            quantity INTEGER NOT NULL DEFAULT 1, unit_price REAL NOT NULL DEFAULT 0.0,
+            total_amount REAL NOT NULL DEFAULT 0.0, status TEXT NOT NULL DEFAULT 'pending',
+            delivery_status TEXT NOT NULL DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP, FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (product_id) REFERENCES products(id))""")
+        cursor.execute("""CREATE TABLE IF NOT EXISTS order_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL, stock_id INTEGER,
+            delivered_content TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE,
+            FOREIGN KEY (stock_id) REFERENCES stock(id) ON DELETE SET NULL)""")
+        cursor.execute("""CREATE TABLE IF NOT EXISTS balance_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, transaction_type TEXT NOT NULL,
+            amount REAL NOT NULL, balance_before REAL NOT NULL, balance_after REAL NOT NULL,
+            reference TEXT, description TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id))""")
+        cursor.execute("""CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, payment_method TEXT NOT NULL,
+            amount REAL NOT NULL, currency TEXT NOT NULL DEFAULT 'USD', exchange_rate REAL, local_amount REAL,
+            payment_reference TEXT, transaction_id TEXT, status TEXT NOT NULL DEFAULT 'pending',
+            admin_note TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, approved_at TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id))""")
+        cursor.execute("""CREATE TABLE IF NOT EXISTS payment_methods (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, method_type TEXT NOT NULL,
+            details TEXT, currency TEXT NOT NULL DEFAULT 'USD', exchange_rate REAL,
+            is_active INTEGER NOT NULL DEFAULT 1, sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        cursor.execute("""CREATE TABLE IF NOT EXISTS referral_commissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER NOT NULL, referred_user_id INTEGER NOT NULL,
+            payment_id INTEGER, commission_rate REAL NOT NULL, commission_amount REAL NOT NULL,
+            deposit_number INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (referrer_id) REFERENCES users(id), FOREIGN KEY (referred_user_id) REFERENCES users(id),
+            FOREIGN KEY (payment_id) REFERENCES payments(id))""")
+        cursor.execute("""CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        cursor.execute("""CREATE TABLE IF NOT EXISTS admin_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, admin_telegram_id INTEGER NOT NULL, action TEXT NOT NULL,
+            target_type TEXT, target_id INTEGER, details TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        cursor.execute("""CREATE TABLE IF NOT EXISTS purchase_intents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, product_id INTEGER NOT NULL,
+            quantity INTEGER NOT NULL, unit_price REAL NOT NULL, total_amount REAL NOT NULL,
+            payment_required REAL NOT NULL DEFAULT 0.0, status TEXT NOT NULL DEFAULT 'pending_payment',
+            payment_id INTEGER, order_id INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, completed_at TIMESTAMP,
+            FOREIGN KEY(user_id) REFERENCES users(id), FOREIGN KEY(product_id) REFERENCES products(id),
+            FOREIGN KEY(payment_id) REFERENCES payments(id), FOREIGN KEY(order_id) REFERENCES orders(id))""")
+
+        _add_column_if_missing(cursor, "payments", "purchase_intent_id INTEGER", "purchase_intent_id")
+        _add_column_if_missing(cursor, "payments", "confirmed_by INTEGER", "confirmed_by")
+        _add_column_if_missing(cursor, "payments", "confirmed_at TIMESTAMP", "confirmed_at")
+        _add_column_if_missing(cursor, "orders", "payment_id INTEGER", "payment_id")
+        _add_column_if_missing(cursor, "orders", "purchase_intent_id INTEGER", "purchase_intent_id")
+
+        default_settings = {
+            "store_name": "JanKug Store", "support_username": "@JanKug",
+            "referral_commission": "5", "referral_deposit_limit": "10",
+            "binance_pay_id": "Not configured yet", "usd_bdt_rate": "127",
+        }
+        for key, value in default_settings.items():
+            cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, value))
+
+        categories = [
+            ("Communication Apps", "Communication application products", "📱", 1),
+            ("VPN & Proxy", "VPN and proxy products", "🔐", 2),
+            ("Verification Services", "Verification services", "📲", 3),
+        ]
+        for name, description, emoji, sort_order in categories:
+            cursor.execute("SELECT id FROM categories WHERE name=?", (name,))
+            if not cursor.fetchone():
+                cursor.execute("INSERT INTO categories(name,description,emoji,sort_order) VALUES(?,?,?,?)",
+                               (name, description, emoji, sort_order))
+
+        cursor.execute("SELECT id FROM categories WHERE name='Communication Apps'")
+        comm_id = cursor.fetchone()["id"]
+        cursor.execute("SELECT id FROM categories WHERE name='VPN & Proxy'")
+        vpn_id = cursor.fetchone()["id"]
+        product_seed = [
+            (comm_id,"gv_old","Google Voice Old",5.00,None),(comm_id,"gv_new","Google Voice New",3.50,None),
+            (comm_id,"tn_web","TextNow Web",3.00,None),(comm_id,"tn_phone","TextNow Phone",1.70,None),
+            (comm_id,"tf_web","TextFree Web",2.00,None),(comm_id,"tf_phone","TextFree Phone",2.00,None),
+            (comm_id,"sl_web","Sideline Web",2.00,None),(comm_id,"sl_phone","Sideline Phone",2.00,None),
+            (comm_id,"talkatone","Talkatone",2.00,None),(comm_id,"textplus","TextPlus",2.00,None),
+            (vpn_id,"express_3","Express VPN — 3 Days",1.00,3),(vpn_id,"cyberghost_3","CyberGhost VPN — 3 Days",1.00,3),
+            (vpn_id,"vypr_3","Vypr VPN — 3 Days",1.00,3),(vpn_id,"panda_3","Panda VPN — 3 Days",1.00,3),
+            (vpn_id,"express_7","Express VPN — 7 Days",1.50,7),(vpn_id,"nord_7","Nord VPN — 7 Days",1.50,7),
+            (vpn_id,"pia_7","PIA VPN — 7 Days",1.50,7),(vpn_id,"ipvanish_7","IPVanish VPN — 7 Days",1.50,7),
+            (vpn_id,"surfshark_7","Surfshark VPN — 7 Days",1.50,7),(vpn_id,"hotspotshield_7","HotspotShield VPN — 7 Days",1.50,7),
+            (vpn_id,"hma_7","HMA VPN — 7 Days",1.50,7),(vpn_id,"pure_7","Pure VPN — 7 Days",1.50,7),
+            (vpn_id,"turbo_7","Turbo VPN — 7 Days",1.50,7),(vpn_id,"avast_7","Avast VPN — 7 Days",1.50,7),
+            (vpn_id,"adguard_7","AdGuard VPN — 7 Days",1.50,7),(vpn_id,"norton_7","Norton VPN — 7 Days",1.50,7),
+            (vpn_id,"avg_7","AVG VPN — 7 Days",1.50,7),(vpn_id,"x_7","X-VPN — 7 Days",1.50,7),
+            (vpn_id,"sky_7","Sky VPN — 7 Days",1.50,7),(vpn_id,"potato_7","Potato VPN — 7 Days",1.50,7),
+            (vpn_id,"bitdefender_7","Bitdefender VPN — 7 Days",1.50,7),(vpn_id,"octohide_14","Octohide — 14 Days",2.00,14),
+            (vpn_id,"express_30","Express VPN (1 Device) — 30 Days",3.00,30),(vpn_id,"nord_30","Nord VPN — 30 Days",3.00,30),
+            (vpn_id,"pia_30","PIA VPN (1 Device) — 30 Days",3.00,30),(vpn_id,"avast_30","Avast VPN — 30 Days",3.00,30),
+            (vpn_id,"bitdefender_30","Bitdefender VPN — 30 Days",3.00,30),(vpn_id,"hma_30","HMA VPN — 30 Days",3.00,30),
+            (vpn_id,"mysterium_30","Mysterium VPN — 30 Days",3.00,30),(vpn_id,"mysterium_dark_30","Mysterium Dark — 30 Days",3.00,30),
+            (vpn_id,"windscribe_30","Windscribe VPN — 30 Days",3.00,30),(vpn_id,"proton_30","Proton VPN — 30 Days",3.00,30),
+        ]
+        for category_id, key, name, price, validity in product_seed:
+            cursor.execute("SELECT id FROM products WHERE product_key=?", (key,))
+            if not cursor.fetchone():
+                cursor.execute("""INSERT INTO products(category_id,product_key,name,price,product_type,validity_days)
+                                  VALUES(?,?,?,?,?,?)""", (category_id,key,name,price,"stock",validity))
+
+        cursor.execute("SELECT id FROM payment_methods WHERE method_type='binance_pay'")
+        if not cursor.fetchone():
+            cursor.execute("""INSERT INTO payment_methods(name,method_type,details,currency,is_active,sort_order)
+                              VALUES(?,?,?,?,1,1)""",
+                           ("Binance Pay","binance_pay","Use Binance Pay ID shown by the store.","USD"))
+        connection.commit()
     except Exception:
-        await q.answer("Invalid quantity.",show_alert=True); return
-    product=get_product_by_key(product_key)
-    if not product: await q.answer("Product not found.",show_alert=True); return
-    stock=get_available_stock_count(product["id"])
-    if stock < quantity:
-        await q.answer(f"Only {stock} in stock.",show_alert=True); return
-    total=round(float(product["price"])*quantity,2); balance=get_balance(update.effective_user.id)
-    if balance+1e-9 >= total:
-        kb=InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ Buy {quantity} for ${total:.2f}",callback_data=f"confirmbuy:{product_key}:{quantity}")],[InlineKeyboardButton("🔙 Back",callback_data=f"product_{product_key}")]])
-        await q.answer(); await q.edit_message_text(f"🛒 ORDER SUMMARY\n━━━━━━━━━━━━━━━━\n\nProduct: {product['name']}\nQuantity: {quantity}\nUnit price: ${float(product['price']):.2f}\nTotal: ${total:.2f}\n\n💳 Your balance: ${balance:.2f}\n\nYour balance is sufficient.",reply_markup=kb)
-    else:
-        required=round(total-balance,2)
-        kb=InlineKeyboardMarkup([[InlineKeyboardButton(f"💰 Pay ${required:.2f} & Continue",callback_data=f"paypurchase:{product_key}:{quantity}")],[InlineKeyboardButton("🔙 Back",callback_data=f"product_{product_key}")]])
-        await q.answer(); await q.edit_message_text(f"🛒 ORDER SUMMARY\n━━━━━━━━━━━━━━━━\n\nProduct: {product['name']}\nQuantity: {quantity}\nTotal: ${total:.2f}\n\n💳 Current balance: ${balance:.2f}\n❗ Additional payment required: ${required:.2f}\n\nAfter payment is confirmed, the purchase will continue automatically.",reply_markup=kb)
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
-async def confirm_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query
-    try: _,product_key,qty_raw=q.data.split(":",2); quantity=int(qty_raw)
-    except Exception: await q.answer("Invalid order.",show_alert=True); return
-    product=get_product_by_key(product_key)
-    if not product: await q.answer("Product not found.",show_alert=True); return
-    total=round(float(product["price"])*quantity,2); balance=get_balance(update.effective_user.id)
-    if balance+1e-9<total: await q.answer("Your balance is no longer sufficient.",show_alert=True); return
+def get_user(telegram_id: int):
+    connection=get_connection(); cursor=connection.cursor()
+    cursor.execute("SELECT * FROM users WHERE telegram_id=?", (telegram_id,))
+    row=cursor.fetchone(); connection.close(); return row
+
+
+def create_user(telegram_id: int, username: Optional[str]=None, first_name: Optional[str]=None,
+                last_name: Optional[str]=None, referred_by: Optional[int]=None):
+    connection=get_connection(); cursor=connection.cursor()
     try:
-        intent=create_purchase_intent(update.effective_user.id,product["id"],quantity,0)
-        result=complete_purchase(intent)
-        await q.answer("Purchase completed!")
-        await q.edit_message_text(f"✅ PURCHASE COMPLETE\n━━━━━━━━━━━━━━━━\n\nOrder #{result['order_id']}\nProduct: {result['product_name']}\nQuantity: {result['quantity']}\nTotal: ${result['total']:.2f}\n\n💳 Remaining balance: ${result['balance_after']:.2f}\n\n📦 Delivery is being sent...",reply_markup=back_main_keyboard())
-        await send_purchase_delivery(context.bot, result)
-    except Exception as e:
-        await q.answer(str(e),show_alert=True)
+        cursor.execute("BEGIN")
+        cursor.execute("""INSERT OR IGNORE INTO users(telegram_id,username,first_name,last_name,referred_by)
+                          VALUES(?,?,?,?,?)""",(telegram_id,username,first_name,last_name,referred_by))
+        if cursor.rowcount == 1 and referred_by:
+            cursor.execute("UPDATE users SET total_referrals=total_referrals+1 WHERE id=?", (referred_by,))
+        connection.commit()
+    except Exception:
+        connection.rollback(); raise
+    finally: connection.close()
 
 
-async def pay_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query
-    try: _,product_key,qty_raw=q.data.split(":",2); quantity=int(qty_raw)
-    except Exception: await q.answer("Invalid order.",show_alert=True); return
-    product=get_product_by_key(product_key)
-    if not product: await q.answer("Product not found.",show_alert=True); return
-    total=round(float(product["price"])*quantity,2); balance=get_balance(update.effective_user.id); required=max(0,round(total-balance,2))
-    if required<=0: await q.answer("No payment is needed now.",show_alert=True); return
-    stock=get_available_stock_count(product["id"])
-    if stock<quantity: await q.answer("Stock is no longer sufficient.",show_alert=True); return
-    intent=create_purchase_intent(update.effective_user.id,product["id"],quantity,required)
-    payment_id=create_payment(update.effective_user.id,required,"binance_pay",intent,"USD")
-    pay_id=get_setting("binance_pay_id","Not configured yet")
-    context.user_data["awaiting_payment_tx"] = payment_id
-    kb=InlineKeyboardMarkup([[InlineKeyboardButton("✍️ Enter Binance Order ID",callback_data=f"enterpay:{payment_id}")],[InlineKeyboardButton("❌ Cancel",callback_data=f"cancel_user_payment:{payment_id}")]])
-    await q.answer(); await q.edit_message_text(f"💳 PAYMENT REQUIRED\n━━━━━━━━━━━━━━━━\n\nProduct: {product['name']}\nQuantity: {quantity}\nPurchase total: ${total:.2f}\nCurrent balance: ${balance:.2f}\nPayment required: ${required:.2f}\n\n🔶 Method: Binance Pay\n🆔 Payment Request: #{payment_id}\n💳 Binance Pay ID: {pay_id}\n\nSend the payment through Binance Pay, then submit your Binance Order ID.\n\nAfter admin confirmation, your balance will be credited and this purchase will be completed automatically.",reply_markup=kb)
-    for admin_id in ADMIN_IDS:
-        try: await context.bot.send_message(admin_id,f"🔔 NEW PURCHASE PAYMENT\nPayment #{payment_id}\nUser: {update.effective_user.id}\nProduct: {product['name']} x{quantity}\nRequired: ${required:.2f}\n\nUser must submit Binance Order ID before approval.")
-        except Exception: pass
+def update_user(telegram_id: int, username: Optional[str]=None, first_name: Optional[str]=None,
+                last_name: Optional[str]=None):
+    connection=get_connection(); cursor=connection.cursor()
+    cursor.execute("""UPDATE users SET username=?,first_name=?,last_name=?,updated_at=CURRENT_TIMESTAMP
+                      WHERE telegram_id=?""",(username,first_name,last_name,telegram_id))
+    connection.commit(); connection.close()
 
 
-async def enter_payment(update, context):
-    q=update.callback_query
-    payment_id=int(q.data.split(":",1)[1]); payment=get_payment(payment_id)
-    if not payment or payment["telegram_id"]!=update.effective_user.id or payment["status"]!="pending": await q.answer("Payment is not available.",show_alert=True); return
-    context.user_data["awaiting_payment_tx"]=payment_id
-    await q.answer(); await q.edit_message_text(f"✍️ PAYMENT #{payment_id}\n\nPlease send your Binance Order ID as a text message.\n\nExample: 1234567890",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data=f"cancel_user_payment:{payment_id}")]]))
+def get_balance(telegram_id: int) -> float:
+    row=get_user(telegram_id); return float(row["balance"]) if row else 0.0
 
 
-async def cancel_user_payment(update, context):
-    q=update.callback_query; payment_id=int(q.data.split(":",1)[1]); payment=get_payment(payment_id)
-    if not payment or payment["telegram_id"]!=update.effective_user.id: await q.answer("Invalid payment.",show_alert=True); return
-    # User cancellation is handled directly as pending -> cancelled.
-    from db import cancel_payment as db_cancel_payment
+def change_balance(telegram_id: int, amount: float, transaction_type: str,
+                   reference: Optional[str]=None, description: Optional[str]=None):
+    connection=get_connection(); cursor=connection.cursor()
     try:
-        db_cancel_payment(payment_id, update.effective_user.id, "Cancelled by customer")
-        context.user_data.pop("awaiting_payment_tx",None)
-        await q.answer("Payment cancelled."); await q.edit_message_text("❌ Payment cancelled.",reply_markup=back_main_keyboard())
-    except Exception as e: await q.answer(str(e),show_alert=True)
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT id,balance FROM users WHERE telegram_id=?", (telegram_id,)); user=cursor.fetchone()
+        if not user: raise ValueError("User does not exist.")
+        before=float(user["balance"]); after=before+float(amount)
+        if after < -1e-9: raise ValueError("Insufficient balance.")
+        cursor.execute("UPDATE users SET balance=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(round(after,8),user["id"]))
+        cursor.execute("""INSERT INTO balance_transactions(user_id,transaction_type,amount,balance_before,balance_after,reference,description)
+                          VALUES(?,?,?,?,?,?,?)""",(user["id"],transaction_type,float(amount),before,round(after,8),reference,description))
+        connection.commit(); return round(after,8)
+    except Exception:
+        connection.rollback(); raise
+    finally: connection.close()
 
 
-async def text_message_handler(update, context):
-    if not update.message: return
-    payment_id=context.user_data.get("awaiting_payment_tx")
-    if payment_id:
-        raw=update.message.text.strip()
-        if len(raw)<3 or len(raw)>100:
-            await update.message.reply_text("❌ Invalid Binance Order ID. Please send the Order ID as text."); return
-        payment=get_payment(payment_id)
-        if not payment or payment["telegram_id"]!=update.effective_user.id or payment["status"]!="pending":
-            context.user_data.pop("awaiting_payment_tx",None)
-            await update.message.reply_text("This payment is no longer pending.",reply_markup=main_menu_keyboard()); return
-        try:
-            submit_payment_reference(payment_id,raw); context.user_data.pop("awaiting_payment_tx",None)
-            await update.message.reply_text(f"✅ Payment reference submitted.\n\nPayment #{payment_id} is waiting for admin confirmation.\nYou do not need to restart your purchase.",reply_markup=main_menu_keyboard())
-            for admin_id in ADMIN_IDS:
-                try: await context.bot.send_message(admin_id,f"💳 PAYMENT REFERENCE SUBMITTED\nPayment #{payment_id}\nUser: {update.effective_user.id}\nBinance Order ID: {raw}\n\nApprove with /approve_payment {payment_id}")
-                except Exception: pass
-        except Exception as e: await update.message.reply_text(f"❌ {e}")
-        return
-    await update.message.reply_text(f"🏠 {STORE_NAME}\n━━━━━━━━━━━━━━━━\n\nChoose an option below.",reply_markup=main_menu_keyboard())
+def get_setting(key: str, default: Optional[str]=None):
+    connection=get_connection(); cursor=connection.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key=?",(key,))
+    row=cursor.fetchone(); connection.close(); return row["value"] if row else default
 
 
-async def buy_vpn(update, context):
-    q=update.callback_query; await q.answer(); kb=[[InlineKeyboardButton("03 Days",callback_data="vpn_03_days"),InlineKeyboardButton("07 Days",callback_data="vpn_07_days")],[InlineKeyboardButton("14 Days",callback_data="vpn_14_days"),InlineKeyboardButton("30 Days",callback_data="vpn_30_days")],[InlineKeyboardButton("🏠 Main Menu",callback_data="main_menu")]]; await q.edit_message_text("🔐 BUY VPN\n━━━━━━━━━━━━━━━━\n\n📅 Select validity:",reply_markup=InlineKeyboardMarkup(kb))
-
-async def vpn_03_days(update,context):
-    q=update.callback_query; await q.answer(); kb=[[InlineKeyboardButton("Express VPN",callback_data="vpn_product_express_3"),InlineKeyboardButton("CyberGhost VPN",callback_data="vpn_product_cyberghost_3")],[InlineKeyboardButton("Vypr VPN",callback_data="vpn_product_vypr_3"),InlineKeyboardButton("Panda VPN",callback_data="vpn_product_panda_3")],[InlineKeyboardButton("🔙 Back",callback_data="buy_vpn")]]; await q.edit_message_text("🔐 VPN — 03 DAYS\n━━━━━━━━━━━━━━━━\n\nSelect a VPN:",reply_markup=InlineKeyboardMarkup(kb))
-
-async def vpn_07_days(update,context):
-    q=update.callback_query; await q.answer(); kb=[[InlineKeyboardButton("Express VPN",callback_data="vpn_product_express_7"),InlineKeyboardButton("Nord VPN",callback_data="vpn_product_nord_7")],[InlineKeyboardButton("PIA VPN",callback_data="vpn_product_pia_7"),InlineKeyboardButton("IPVanish VPN",callback_data="vpn_product_ipvanish_7")],[InlineKeyboardButton("Surfshark VPN",callback_data="vpn_product_surfshark_7"),InlineKeyboardButton("HotspotShield VPN",callback_data="vpn_product_hotspotshield_7")],[InlineKeyboardButton("HMA VPN",callback_data="vpn_product_hma_7"),InlineKeyboardButton("Pure VPN",callback_data="vpn_product_pure_7")],[InlineKeyboardButton("🔙 Back",callback_data="buy_vpn"),InlineKeyboardButton("Next ➡️",callback_data="vpn_07_page_2")]]; await q.edit_message_text("🔐 VPN — 07 DAYS\n━━━━━━━━━━━━━━━━\n\nPage 1",reply_markup=InlineKeyboardMarkup(kb))
-
-async def vpn_07_page_2(update,context):
-    q=update.callback_query; await q.answer(); kb=[[InlineKeyboardButton("Turbo VPN",callback_data="vpn_product_turbo_7"),InlineKeyboardButton("Avast VPN",callback_data="vpn_product_avast_7")],[InlineKeyboardButton("AdGuard VPN",callback_data="vpn_product_adguard_7"),InlineKeyboardButton("Norton VPN",callback_data="vpn_product_norton_7")],[InlineKeyboardButton("AVG VPN",callback_data="vpn_product_avg_7"),InlineKeyboardButton("X-VPN",callback_data="vpn_product_x_7")],[InlineKeyboardButton("Sky VPN",callback_data="vpn_product_sky_7"),InlineKeyboardButton("Potato VPN",callback_data="vpn_product_potato_7")],[InlineKeyboardButton("🔙 Back",callback_data="vpn_07_days"),InlineKeyboardButton("Next ➡️",callback_data="vpn_07_page_3")]]; await q.edit_message_text("🔐 VPN — 07 DAYS\n━━━━━━━━━━━━━━━━\n\nPage 2",reply_markup=InlineKeyboardMarkup(kb))
-
-async def vpn_07_page_3(update,context):
-    q=update.callback_query; await q.answer(); kb=[[InlineKeyboardButton("Bitdefender VPN",callback_data="vpn_product_bitdefender_7")],[InlineKeyboardButton("🔙 Back",callback_data="vpn_07_page_2")]]; await q.edit_message_text("🔐 VPN — 07 DAYS\n━━━━━━━━━━━━━━━━\n\nPage 3",reply_markup=InlineKeyboardMarkup(kb))
-
-async def vpn_14_days(update,context):
-    q=update.callback_query; await q.answer(); kb=[[InlineKeyboardButton("Octohide",callback_data="vpn_product_octohide_14")],[InlineKeyboardButton("🔙 Back",callback_data="buy_vpn")]]; await q.edit_message_text("🔐 VPN — 14 DAYS\n━━━━━━━━━━━━━━━━\n\nSelect a VPN:",reply_markup=InlineKeyboardMarkup(kb))
-
-async def vpn_30_days(update,context):
-    q=update.callback_query; await q.answer(); kb=[[InlineKeyboardButton("Express VPN (1 Device)",callback_data="vpn_product_express_30"),InlineKeyboardButton("Nord VPN",callback_data="vpn_product_nord_30")],[InlineKeyboardButton("PIA VPN (1 Device)",callback_data="vpn_product_pia_30"),InlineKeyboardButton("Avast VPN",callback_data="vpn_product_avast_30")],[InlineKeyboardButton("Bitdefender VPN",callback_data="vpn_product_bitdefender_30"),InlineKeyboardButton("HMA VPN",callback_data="vpn_product_hma_30")],[InlineKeyboardButton("Mysterium VPN",callback_data="vpn_product_mysterium_30"),InlineKeyboardButton("MYSTERIUM DARK",callback_data="vpn_product_mysterium_dark_30")],[InlineKeyboardButton("Windscribe VPN",callback_data="vpn_product_windscribe_30"),InlineKeyboardButton("Proton VPN",callback_data="vpn_product_proton_30")],[InlineKeyboardButton("🔙 Back",callback_data="buy_vpn")]]; await q.edit_message_text("🔐 VPN — 30 DAYS\n━━━━━━━━━━━━━━━━\n\nSelect a VPN:",reply_markup=InlineKeyboardMarkup(kb))
+def set_setting(key: str, value: Any):
+    connection=get_connection(); cursor=connection.cursor()
+    cursor.execute("""INSERT INTO settings(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP""",(key,str(value)))
+    connection.commit(); connection.close()
 
 
-async def coming_soon(update,context):
-    q=update.callback_query; await q.answer(); await q.edit_message_text("🚧 COMING SOON\n\nThis category will be available soon.",reply_markup=back_main_keyboard())
-
-async def buy_proxy(update,context):
-    q=update.callback_query; await q.answer(); await q.edit_message_text("🌐 BUY PROXY\n━━━━━━━━━━━━━━━━\n\n🚧 Coming soon.",reply_markup=back_main_keyboard())
-async def verification_service(update,context):
-    q=update.callback_query; await q.answer(); await q.edit_message_text("🧑‍💻 VERIFICATION SERVICES\n━━━━━━━━━━━━━━━━\n\n🚧 Coming soon.",reply_markup=back_main_keyboard())
-
-async def buy_more_products(update,context):
-    q=update.callback_query; await q.answer(); kb=[[InlineKeyboardButton("📧 Email Accounts",callback_data="coming_soon_email"),InlineKeyboardButton("⭐ Premium Apps",callback_data="coming_soon_premium")],[InlineKeyboardButton("💻 Software & Tools",callback_data="coming_soon_software"),InlineKeyboardButton("🎮 Gaming Products",callback_data="coming_soon_gaming")],[InlineKeyboardButton("🏠 Main Menu",callback_data="main_menu")]]; await q.edit_message_text("🛍️ BUY MORE PRODUCTS\n━━━━━━━━━━━━━━━━\n\nSelect a category:",reply_markup=InlineKeyboardMarkup(kb))
+def get_product_by_key(product_key: str):
+    connection=get_connection(); cursor=connection.cursor(); cursor.execute("SELECT * FROM products WHERE product_key=?",(product_key,))
+    row=cursor.fetchone(); connection.close(); return row
 
 
-async def add_balance(update,context):
-    q=update.callback_query; await q.answer(); context.user_data["awaiting_balance_amount"]=True
-    await q.edit_message_text("💰 ADD BALANCE\n━━━━━━━━━━━━━━━━\n\nEnter the USD amount you want to add.\nMinimum: $0.10\n\nExample: 10",reply_markup=back_main_keyboard())
-
-async def create_balance_payment_from_text(update,context,amount):
-    if amount<0.10: await update.message.reply_text("❌ Minimum amount is $0.10."); return
-    payment_id=create_payment(update.effective_user.id,round(amount,2),"binance_pay",None,"USD")
-    context.user_data["awaiting_balance_tx"]=payment_id; context.user_data.pop("awaiting_balance_amount",None)
-    pay_id=get_setting("binance_pay_id","Not configured yet")
-    await update.message.reply_text(f"💳 BINANCE PAY\n━━━━━━━━━━━━━━━━\n\nPayment #{payment_id}\nAmount: ${amount:.2f}\nBinance Pay ID: {pay_id}\n\nSend the payment, then send your Binance Order ID here.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data=f"cancel_user_payment:{payment_id}")]]))
-    for admin_id in ADMIN_IDS:
-        try: await context.bot.send_message(admin_id,f"🔔 NEW BALANCE PAYMENT\nPayment #{payment_id}\nUser: {update.effective_user.id}\nAmount: ${amount:.2f}\nWaiting for Binance Order ID.")
-        except Exception: pass
+def get_product(product_id: int):
+    connection=get_connection(); cursor=connection.cursor(); cursor.execute("SELECT * FROM products WHERE id=?",(product_id,))
+    row=cursor.fetchone(); connection.close(); return row
 
 
-async def add_balance_text_handler(update,context):
-    if not update.message: return False
-    if context.user_data.get("awaiting_balance_amount"):
-        raw=update.message.text.strip()
-        try: amount=float(raw)
-        except ValueError: await update.message.reply_text("❌ Please enter a valid USD amount, for example 10."); return True
-        await create_balance_payment_from_text(update,context,amount); return True
-    return False
+def get_available_stock_count(product_id: int) -> int:
+    connection=get_connection(); cursor=connection.cursor()
+    cursor.execute("SELECT COUNT(*) AS total FROM stock WHERE product_id=? AND status='available'",(product_id,))
+    row=cursor.fetchone(); connection.close(); return int(row["total"])
 
 
-async def my_orders(update,context):
-    q=update.callback_query; await q.answer(); rows=get_recent_orders(update.effective_user.id,24,20)
-    if not rows:
-        await q.edit_message_text("📦 MY ORDERS\n━━━━━━━━━━━━━━━━\n\nNo completed orders in the last 24 hours.",reply_markup=back_main_keyboard()); return
-    parts=["📦 MY ORDERS — LAST 24 HOURS","━━━━━━━━━━━━━━━━"]
-    for order in rows:
-        parts.append(f"\n🧾 Order #{order['id']}\nProduct: {order['name']}\nQty: {order['quantity']}\nTotal: ${float(order['total_amount']):.2f}\nStatus: {order['status']}")
-        items=get_order_items(order["id"])
-        for i,item in enumerate(items,1):
-            content=item["delivered_content"] or ""
-            # Mask likely password-looking fields in the display without modifying stored delivery.
-            masked=content
-            if "password:" in masked.lower():
-                import re
-                masked=re.sub(r"(?i)(password\s*:\s*)([^\s\n]+)",r"\1••••••",masked)
-            parts.append(f"  #{i}: {masked}")
-    await q.edit_message_text("\n".join(parts),reply_markup=back_main_keyboard())
-
-async def refer(update,context):
-    q=update.callback_query; await q.answer(); user=update.effective_user; ensure_user(update); bot_username=context.bot.username; link=f"https://t.me/{bot_username}?start=ref_{user.id}" if bot_username else "Referral link unavailable"; u=get_user(user.id); commission=get_setting("referral_commission",str(DEFAULT_REFERRAL_COMMISSION)); limit=get_setting("referral_deposit_limit",str(DEFAULT_REFERRAL_DEPOSIT_LIMIT)); await q.edit_message_text(f"👥 REFERRAL PROGRAM\n━━━━━━━━━━━━━━━━\n\n🎯 Your Referral Link:\n{link}\n\n💰 Commission: {commission}%\n📌 Commission applies to the first {limit} deposits.\n\n📊 Total Referrals: {u['total_referrals']}\n🎁 Referral Income: ${float(u['referral_income']):.2f}",reply_markup=back_main_keyboard())
-
-async def support(update,context):
-    q=update.callback_query; await q.answer(); await q.edit_message_text(f"🎧 SUPPORT\n━━━━━━━━━━━━━━━━\n\nFor support, please contact:\n{SUPPORT_USERNAME}",reply_markup=back_main_keyboard())
-
-
-async def admin_only(update):
-    return update.effective_user and update.effective_user.id in ADMIN_IDS
-
-async def pending_payments(update,context):
-    if not await admin_only(update): return
-    # This command intentionally gives a concise queue; approval is still explicit.
-    from db import get_connection
-    con=get_connection(); cur=con.cursor(); cur.execute("""SELECT p.id,p.amount,p.transaction_id,p.created_at,u.telegram_id,pi.product_id,pi.quantity,pr.name
-        FROM payments p JOIN users u ON u.id=p.user_id LEFT JOIN purchase_intents pi ON pi.id=p.purchase_intent_id LEFT JOIN products pr ON pr.id=pi.product_id
-        WHERE p.status='pending' ORDER BY p.id ASC LIMIT 50"""); rows=cur.fetchall(); con.close()
-    if not rows: await update.message.reply_text("No pending payments."); return
-    lines=["💳 PENDING PAYMENTS"]
-    for r in rows: lines.append(f"\n#{r['id']} — ${float(r['amount']):.2f}\nUser: {r['telegram_id']}\nProduct: {r['name'] or 'Balance top-up'} x{r['quantity'] or '-'}\nTX: {r['transaction_id'] or 'not submitted'}\nApprove: /approve_payment {r['id']}")
-    await update.message.reply_text("\n".join(lines))
-
-async def approve_payment_cmd(update,context):
-    if not await admin_only(update): return
-    if not context.args or not context.args[0].isdigit(): await update.message.reply_text("Usage: /approve_payment PAYMENT_ID"); return
-    payment_id=int(context.args[0]); payment=get_payment(payment_id)
-    if not payment: await update.message.reply_text("Payment not found."); return
-    if not payment["transaction_id"]: await update.message.reply_text("This payment has no Binance Order ID yet."); return
+def create_purchase_intent(telegram_id:int, product_id:int, quantity:int, payment_required:float):
+    if quantity < 1: raise ValueError("Quantity must be at least 1.")
+    connection=get_connection(); cursor=connection.cursor()
     try:
-        result=confirm_payment(payment_id,update.effective_user.id)
-        purchase=result.get("purchase")
-        await update.message.reply_text(f"✅ Payment #{payment_id} confirmed." + (f"\nOrder #{purchase['order_id']} completed and delivered." if purchase else "\nBalance credited."))
-        if purchase and not purchase.get("already_completed"):
-            await context.bot.send_message(purchase["telegram_id"],f"✅ PAYMENT CONFIRMED & ORDER COMPLETED\n━━━━━━━━━━━━━━━━\nPayment #{payment_id}\nOrder #{purchase['order_id']}\nProduct: {purchase['product_name']}\nQuantity: {purchase['quantity']}\nTotal: ${purchase['total']:.2f}\nRemaining balance: ${purchase['balance_after']:.2f}\n\n📦 Delivery is being sent...",reply_markup=back_main_keyboard())
-            await send_purchase_delivery(context.bot, purchase)
+        cursor.execute("BEGIN IMMEDIATE")
+        user=cursor.execute("SELECT id FROM users WHERE telegram_id=?",(telegram_id,)).fetchone()
+        product=cursor.execute("SELECT price FROM products WHERE id=? AND is_active=1",(product_id,)).fetchone()
+        if not user or not product: raise ValueError("User or product not found.")
+        total=round(float(product["price"])*quantity,2)
+        payment_required=max(0.0,round(float(payment_required),2))
+        cursor.execute("""INSERT INTO purchase_intents(user_id,product_id,quantity,unit_price,total_amount,payment_required,status)
+                          VALUES(?,?,?,?,?,?,?)""",(user["id"],product_id,quantity,float(product["price"]),total,payment_required,
+                          "pending_payment" if payment_required>0 else "ready"))
+        pid=cursor.lastrowid; connection.commit(); return pid
+    except Exception:
+        connection.rollback(); raise
+    finally: connection.close()
+
+
+def get_purchase_intent(intent_id:int):
+    connection=get_connection(); cursor=connection.cursor()
+    cursor.execute("""SELECT pi.*,u.telegram_id,p.product_key,p.name,p.price
+        FROM purchase_intents pi JOIN users u ON u.id=pi.user_id JOIN products p ON p.id=pi.product_id WHERE pi.id=?""",(intent_id,))
+    row=cursor.fetchone(); connection.close(); return row
+
+
+def create_payment(telegram_id:int, amount:float, payment_method:str, purchase_intent_id:Optional[int]=None,
+                   currency="USD", exchange_rate=None, local_amount=None):
+    connection=get_connection(); cursor=connection.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        user=cursor.execute("SELECT id FROM users WHERE telegram_id=?",(telegram_id,)).fetchone()
+        if not user: raise ValueError("User does not exist.")
+        cursor.execute("""INSERT INTO payments(user_id,payment_method,amount,currency,exchange_rate,local_amount,status,purchase_intent_id)
+                          VALUES(?,?,?,?,?,?,?,?)""",(user["id"],payment_method,float(amount),currency,exchange_rate,local_amount,"pending",purchase_intent_id))
+        payment_id=cursor.lastrowid
+        if purchase_intent_id:
+            cursor.execute("UPDATE purchase_intents SET payment_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending_payment'",(payment_id,purchase_intent_id))
+        connection.commit(); return payment_id
+    except Exception:
+        connection.rollback(); raise
+    finally: connection.close()
+
+
+def get_payment(payment_id:int):
+    connection=get_connection(); cursor=connection.cursor()
+    cursor.execute("""SELECT pay.*,u.telegram_id,pi.product_id,pi.quantity,pi.total_amount,pi.status AS purchase_status
+        FROM payments pay JOIN users u ON u.id=pay.user_id LEFT JOIN purchase_intents pi ON pi.id=pay.purchase_intent_id WHERE pay.id=?""",(payment_id,))
+    row=cursor.fetchone(); connection.close(); return row
+
+
+def submit_payment_reference(payment_id:int, transaction_id:str):
+    connection=get_connection(); cursor=connection.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        payment=cursor.execute("SELECT * FROM payments WHERE id=?",(payment_id,)).fetchone()
+        if not payment: raise ValueError("Payment not found.")
+        if payment["status"]!="pending": raise ValueError("Payment is no longer pending.")
+        cursor.execute("UPDATE payments SET transaction_id=?,payment_reference=?,admin_note=NULL WHERE id=?",(transaction_id.strip(),transaction_id.strip(),payment_id))
+        connection.commit()
+    except Exception:
+        connection.rollback(); raise
+    finally: connection.close()
+
+
+def _complete_purchase_locked(cursor, intent_id:int, payment_id:Optional[int]=None, confirmed_by:Optional[int]=None):
+    intent=cursor.execute("""SELECT pi.*,u.telegram_id,u.balance,p.name,p.price,p.product_type,c.name AS category_name FROM purchase_intents pi
+                            JOIN users u ON u.id=pi.user_id JOIN products p ON p.id=pi.product_id
+                            LEFT JOIN categories c ON c.id=p.category_id WHERE pi.id=?""",(intent_id,)).fetchone()
+    if not intent: raise ValueError("Purchase intent not found.")
+    if intent["status"]=="completed":
+        return {"already_completed":True,"order_id":intent["order_id"],"telegram_id":intent["telegram_id"],"delivered":[]}
+    if intent["status"] not in ("ready","pending_payment"): raise ValueError("Purchase is not payable/completable.")
+    quantity=int(intent["quantity"]); total=float(intent["total_amount"])
+    available=cursor.execute("SELECT id,stock_content FROM stock WHERE product_id=? AND status='available' ORDER BY id LIMIT ?",(intent["product_id"],quantity)).fetchall()
+    if len(available)<quantity: raise ValueError(f"Only {len(available)} item(s) are currently in stock.")
+    balance=float(intent["balance"])
+    if balance+1e-9<total: raise ValueError("Insufficient balance to complete purchase.")
+    before=balance; after=round(balance-total,8)
+    cursor.execute("UPDATE users SET balance=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(after,intent["user_id"]))
+    cursor.execute("""INSERT INTO balance_transactions(user_id,transaction_type,amount,balance_before,balance_after,reference,description)
+                      VALUES(?,?,?,?,?,?,?)""",(intent["user_id"],"purchase",-total,before,after,f"purchase:{intent_id}",f"Purchase #{intent_id}: {intent['name']} x{quantity}"))
+    cursor.execute("""INSERT INTO orders(user_id,product_id,quantity,unit_price,total_amount,status,delivery_status,payment_id,purchase_intent_id,completed_at)
+                      VALUES(?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",(intent["user_id"],intent["product_id"],quantity,intent["unit_price"],total,"completed","delivered",payment_id,intent_id))
+    order_id=cursor.lastrowid; delivered=[]
+    for item in available:
+        cursor.execute("UPDATE stock SET status='sold',order_id=?,sold_at=CURRENT_TIMESTAMP WHERE id=? AND status='available'",(order_id,item["id"]))
+        if cursor.rowcount!=1: raise ValueError("Stock changed while processing. Please try again.")
+        cursor.execute("INSERT INTO order_items(order_id,stock_id,delivered_content) VALUES(?,?,?)",(order_id,item["id"],item["stock_content"]))
+        delivered.append(item["stock_content"])
+    cursor.execute("UPDATE purchase_intents SET status='completed',order_id=?,updated_at=CURRENT_TIMESTAMP,completed_at=CURRENT_TIMESTAMP WHERE id=?",(order_id,intent_id))
+    return {"already_completed":False,"order_id":order_id,"telegram_id":intent["telegram_id"],"delivered":delivered,"total":total,"balance_after":after,"product_name":intent["name"],"quantity":quantity,
+            "product_type":intent["product_type"],"category_name":intent["category_name"]}
+
+
+def complete_purchase(intent_id:int):
+    connection=get_connection(); cursor=connection.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE"); result=_complete_purchase_locked(cursor,intent_id); connection.commit(); return result
+    except Exception:
+        connection.rollback(); raise
+    finally: connection.close()
+
+
+def confirm_payment(payment_id:int, admin_id:int):
+    connection=get_connection(); cursor=connection.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        payment=cursor.execute("SELECT * FROM payments WHERE id=?",(payment_id,)).fetchone()
+        if not payment: raise ValueError("Payment not found.")
+        if payment["status"]=="paid":
+            intent_id=payment["purchase_intent_id"]
+            result={"payment_id":payment_id,"already_paid":True,"purchase":None}
+            if intent_id: result["purchase"]=_complete_purchase_locked(cursor,intent_id,payment_id,admin_id)
+            connection.commit(); return result
+        if payment["status"]!="pending": raise ValueError(f"Payment status is {payment['status']}.")
+        user=cursor.execute("SELECT id,balance FROM users WHERE id=?",(payment["user_id"],)).fetchone()
+        before=float(user["balance"]); amount=float(payment["amount"]); after=round(before+amount,8)
+        cursor.execute("UPDATE users SET balance=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(after,user["id"]))
+        cursor.execute("""INSERT INTO balance_transactions(user_id,transaction_type,amount,balance_before,balance_after,reference,description)
+                          VALUES(?,?,?,?,?,?,?)""",(user["id"],"payment",amount,before,after,f"payment:{payment_id}",f"Payment #{payment_id} confirmed"))
+        cursor.execute("UPDATE payments SET status='paid',approved_at=CURRENT_TIMESTAMP,confirmed_at=CURRENT_TIMESTAMP,confirmed_by=? WHERE id=?",(admin_id,payment_id))
+        intent_id=payment["purchase_intent_id"]; purchase=None
+        if intent_id:
+            cursor.execute("UPDATE purchase_intents SET status='ready',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending_payment'",(intent_id,))
+            purchase=_complete_purchase_locked(cursor,intent_id,payment_id,admin_id)
+        connection.commit(); return {"payment_id":payment_id,"already_paid":False,"purchase":purchase}
+    except Exception:
+        connection.rollback(); raise
+    finally: connection.close()
+
+
+def cancel_payment(payment_id:int, admin_id:int, note:Optional[str]=None):
+    connection=get_connection(); cursor=connection.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        payment=cursor.execute("SELECT purchase_intent_id,status FROM payments WHERE id=?",(payment_id,)).fetchone()
+        if not payment: raise ValueError("Payment not found.")
+        if payment["status"]!="pending": raise ValueError("Payment is no longer pending.")
+        cursor.execute("UPDATE payments SET status='cancelled',admin_note=?,confirmed_by=?,confirmed_at=CURRENT_TIMESTAMP WHERE id=?",(note,admin_id,payment_id))
+        if payment["purchase_intent_id"]:
+            cursor.execute("UPDATE purchase_intents SET status='cancelled',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending_payment'",(payment["purchase_intent_id"],))
+        connection.commit()
+    except Exception:
+        connection.rollback(); raise
+    finally: connection.close()
+
+
+def get_recent_orders(telegram_id:int, hours:int=24, limit:int=20):
+    connection=get_connection(); cursor=connection.cursor()
+    cursor.execute("""SELECT o.*,p.name FROM orders o JOIN users u ON u.id=o.user_id JOIN products p ON p.id=o.product_id
+                      WHERE u.telegram_id=? AND o.created_at >= datetime('now', ?) ORDER BY o.id DESC LIMIT ?""",(telegram_id,f"-{hours} hours",limit))
+    rows=cursor.fetchall(); connection.close(); return rows
+
+
+def get_order_items(order_id:int):
+    connection=get_connection(); cursor=connection.cursor()
+    cursor.execute("SELECT * FROM order_items WHERE order_id=? ORDER BY id",(order_id,))
+    rows=cursor.fetchall(); connection.close(); return rows
+
+
+def get_pending_payment(payment_id:int):
+    return get_payment(payment_id)
+
+
+# =========================
+# STAGE 5A ADMIN HELPERS
+# =========================
+
+def admin_dashboard_stats():
+    con=get_connection(); cur=con.cursor()
+    try:
+        total_users=cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        total_products=cur.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        available_stock=cur.execute("SELECT COUNT(*) FROM stock WHERE status='available'").fetchone()[0]
+        total_sales=cur.execute("SELECT COALESCE(SUM(total_amount),0) FROM orders WHERE status='completed'").fetchone()[0]
+        sales_24h=cur.execute("SELECT COALESCE(SUM(total_amount),0) FROM orders WHERE status='completed' AND created_at >= datetime('now','-24 hours')").fetchone()[0]
+        sales_7d=cur.execute("SELECT COALESCE(SUM(total_amount),0) FROM orders WHERE status='completed' AND created_at >= datetime('now','-7 days')").fetchone()[0]
+        sales_30d=cur.execute("SELECT COALESCE(SUM(total_amount),0) FROM orders WHERE status='completed' AND created_at >= datetime('now','-30 days')").fetchone()[0]
+        return {"total_users":int(total_users),"total_products":int(total_products),"available_stock":int(available_stock),
+                "total_sales":float(total_sales or 0),"sales_24h":float(sales_24h or 0),
+                "sales_7d":float(sales_7d or 0),"sales_30d":float(sales_30d or 0)}
+    finally:
+        con.close()
+
+
+def admin_list_products():
+    con=get_connection(); cur=con.cursor()
+    try:
+        return cur.execute("""SELECT p.*,c.name AS category_name,
+            (SELECT COUNT(*) FROM stock s WHERE s.product_id=p.id AND s.status='available') AS available_stock,
+            (SELECT COUNT(*) FROM stock s WHERE s.product_id=p.id AND s.status='sold') AS sold_stock
+            FROM products p LEFT JOIN categories c ON c.id=p.category_id
+            ORDER BY COALESCE(c.sort_order,999),p.sort_order,p.id""").fetchall()
+    finally: con.close()
+
+
+def admin_get_product(product_id:int):
+    con=get_connection(); cur=con.cursor()
+    try:
+        return cur.execute("""SELECT p.*,c.name AS category_name,
+            (SELECT COUNT(*) FROM stock s WHERE s.product_id=p.id AND s.status='available') AS available_stock,
+            (SELECT COUNT(*) FROM stock s WHERE s.product_id=p.id AND s.status='sold') AS sold_stock
+            FROM products p LEFT JOIN categories c ON c.id=p.category_id WHERE p.id=?""",(product_id,)).fetchone()
+    finally: con.close()
+
+
+def admin_list_categories():
+    con=get_connection(); cur=con.cursor()
+    try:
+        return cur.execute("SELECT * FROM categories WHERE is_active=1 ORDER BY sort_order,id").fetchall()
+    finally: con.close()
+
+
+def admin_create_product(category_id:int, product_key:str, name:str, price:float,
+                         description:Optional[str]=None, product_type:str="stock",
+                         validity_days:Optional[int]=None):
+    con=get_connection(); cur=con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        if not cur.execute("SELECT id FROM categories WHERE id=? AND is_active=1",(category_id,)).fetchone():
+            raise ValueError("Category not found or inactive.")
+        if cur.execute("SELECT id FROM products WHERE product_key=?",(product_key,)).fetchone():
+            raise ValueError("Product key already exists.")
+        cur.execute("""INSERT INTO products(category_id,product_key,name,description,price,product_type,validity_days,is_active)
+                       VALUES(?,?,?,?,?,?,?,1)""",
+                    (category_id,product_key,name,description,float(price),product_type,validity_days))
+        pid=cur.lastrowid
+        con.commit(); return pid
+    except Exception:
+        con.rollback(); raise
+    finally: con.close()
+
+
+def admin_update_product(product_id:int, *, name=None, price=None, is_active=None,
+                         category_id=None, description=None):
+    con=get_connection(); cur=con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        p=cur.execute("SELECT * FROM products WHERE id=?",(product_id,)).fetchone()
+        if not p: raise ValueError("Product not found.")
+        values=[]; sets=[]
+        if name is not None: sets.append("name=?"); values.append(str(name))
+        if price is not None: sets.append("price=?"); values.append(float(price))
+        if is_active is not None: sets.append("is_active=?"); values.append(int(is_active))
+        if category_id is not None: sets.append("category_id=?"); values.append(int(category_id))
+        if description is not None: sets.append("description=?"); values.append(str(description))
+        if sets:
+            sets.append("updated_at=CURRENT_TIMESTAMP")
+            values.append(product_id)
+            cur.execute(f"UPDATE products SET {','.join(sets)} WHERE id=?",values)
+        con.commit()
+    except Exception:
+        con.rollback(); raise
+    finally: con.close()
+
+
+def admin_delete_product(product_id:int):
+    con=get_connection(); cur=con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        p=cur.execute("SELECT id,name FROM products WHERE id=?",(product_id,)).fetchone()
+        if not p: raise ValueError("Product not found.")
+        stock_count=cur.execute("SELECT COUNT(*) FROM stock WHERE product_id=?",(product_id,)).fetchone()[0]
+        order_count=cur.execute("SELECT COUNT(*) FROM orders WHERE product_id=?",(product_id,)).fetchone()[0]
+        if stock_count or order_count:
+            cur.execute("UPDATE products SET is_active=0,updated_at=CURRENT_TIMESTAMP WHERE id=?",(product_id,))
+            result="Product has existing stock/order history, so it was safely deactivated."
         else:
-            p=get_payment(payment_id); await context.bot.send_message(p["telegram_id"],f"✅ Payment #{payment_id} confirmed. Your balance has been credited.",reply_markup=main_menu_keyboard())
-    except Exception as e: await update.message.reply_text(f"❌ Could not approve: {e}")
-
-async def cancel_payment_cmd(update,context):
-    if not await admin_only(update): return
-    if not context.args or not context.args[0].isdigit(): await update.message.reply_text("Usage: /cancel_payment PAYMENT_ID"); return
-    try:
-        cancel_payment(int(context.args[0]),update.effective_user.id,"Cancelled by admin")
-        await update.message.reply_text("✅ Payment cancelled.")
-    except Exception as e: await update.message.reply_text(f"❌ {e}")
-
-
-# =========================
-# STAGE 5A — ADMIN PANEL
-# Dashboard + Product Management
-# =========================
-
-def admin_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Dashboard", callback_data="admin_dashboard")],
-        [InlineKeyboardButton("🛍️ Products", callback_data="admin_products")],
-        [InlineKeyboardButton("📦 Stock Management", callback_data="admin_stock_menu")],
-        [InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")],
-    ])
-
-
-async def admin_command(update, context):
-    if not await admin_only(update):
-        return
-    await update.message.reply_text(
-        "🔐 ADMIN PANEL\n━━━━━━━━━━━━━━━━\n\nChoose an option:",
-        reply_markup=admin_kb()
-    )
-
-
-async def admin_dashboard(update, context):
-    q = update.callback_query
-    if not await admin_only(update):
-        await q.answer("Admin access required.", show_alert=True)
-        return
-    await q.answer()
-    s = admin_dashboard_stats()
-    text = (
-        "📊 ADMIN DASHBOARD\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        f"👥 Total Users: {s['total_users']}\n"
-        f"📦 Total Products: {s['total_products']}\n"
-        f"📊 Available Stock: {s['available_stock']}\n\n"
-        f"💰 Total Sales: ${s['total_sales']:.2f}\n"
-        f"💵 Last 24 Hours: ${s['sales_24h']:.2f}\n"
-        f"💵 Last 7 Days: ${s['sales_7d']:.2f}\n"
-        f"💵 Last 1 Month: ${s['sales_30d']:.2f}\n"
-    )
-    await q.edit_message_text(text, reply_markup=admin_kb())
-
-
-def admin_products_kb(products, page=0, per_page=8):
-    start = page * per_page
-    current = products[start:start + per_page]
-    rows = []
-    for p in current:
-        status = "🟢" if int(p["is_active"]) else "🔴"
-        rows.append([InlineKeyboardButton(
-            f"{status} {p['name']} — ${float(p['price']):.2f}",
-            callback_data=f"admin_product:{p['id']}"
-        )])
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"admin_products_page:{page-1}"))
-    if start + per_page < len(products):
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"admin_products_page:{page+1}"))
-    if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton("➕ Add Product", callback_data="admin_add_product")])
-    rows.append([InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel")])
-    return InlineKeyboardMarkup(rows)
-
-
-async def admin_products(update, context, page=0):
-    q = update.callback_query
-    if not await admin_only(update):
-        await q.answer("Admin access required.", show_alert=True)
-        return
-    await q.answer()
-    products = admin_list_products()
-    if not products:
-        text = "🛍️ PRODUCTS\n━━━━━━━━━━━━━━━━\n\nNo products found."
-    else:
-        text = f"🛍️ PRODUCTS\n━━━━━━━━━━━━━━━━\n\nTotal products: {len(products)}\nSelect a product:"
-    await q.edit_message_text(text, reply_markup=admin_products_kb(products, page))
-
-
-async def admin_products_callback(update, context):
-    await admin_products(update, context, 0)
-
-
-async def admin_products_page(update, context):
-    q = update.callback_query
-    if not await admin_only(update):
-        await q.answer("Admin access required.", show_alert=True)
-        return
-    try:
-        page = int(q.data.split(":", 1)[1])
+            cur.execute("DELETE FROM products WHERE id=?",(product_id,))
+            result="Product removed permanently."
+        con.commit(); return result
     except Exception:
-        page = 0
-    await admin_products(update, context, page)
+        con.rollback(); raise
+    finally: con.close()
 
 
-async def admin_product_detail(update, context):
-    q = update.callback_query
-    if not await admin_only(update):
-        await q.answer("Admin access required.", show_alert=True)
-        return
-    product_id = int(q.data.split(":", 1)[1])
-    p = admin_get_product(product_id)
-    if not p:
-        await q.answer("Product not found.", show_alert=True)
-        return
-    await q.answer()
-    stock = int(p["available_stock"])
-    sold = int(p["sold_stock"])
-    status = "🟢 Active" if int(p["is_active"]) else "🔴 Inactive"
-    category = p["category_name"] or "Uncategorized"
-    text = (
-        "🛍️ PRODUCT DETAILS\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        f"ID: {p['id']}\n"
-        f"Name: {p['name']}\n"
-        f"Key: {p['product_key']}\n"
-        f"Category: {category}\n"
-        f"Price: ${float(p['price']):.2f}\n"
-        f"Status: {status}\n"
-        f"📦 Available Stock: {stock}\n"
-        f"📤 Sold Stock: {sold}\n"
-    )
-    toggle = "🔴 Deactivate" if int(p["is_active"]) else "🟢 Activate"
-    kb = [
-        [InlineKeyboardButton("💵 Change Price", callback_data=f"admin_price:{product_id}")],
-        [InlineKeyboardButton(toggle, callback_data=f"admin_toggle:{product_id}")],
-        [InlineKeyboardButton("✏️ Edit Name", callback_data=f"admin_name:{product_id}")],
-        [InlineKeyboardButton("🗑️ Remove Product", callback_data=f"admin_delete:{product_id}")],
-        [InlineKeyboardButton("🔙 Products", callback_data="admin_products")],
-    ]
-    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
-
-
-async def admin_prompt(update, context, kind, product_id, prompt):
-    q = update.callback_query
-    if not await admin_only(update):
-        await q.answer("Admin access required.", show_alert=True)
-        return
-    if not admin_get_product(product_id):
-        await q.answer("Product not found.", show_alert=True)
-        return
-    context.user_data["admin_input"] = {"kind": kind, "product_id": product_id}
-    await q.answer()
-    await q.edit_message_text(
-        prompt,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"admin_product:{product_id}")]
-        ])
-    )
-
-
-async def admin_change_price(update, context):
-    product_id = int(update.callback_query.data.split(":", 1)[1])
-    await admin_prompt(
-        update, context, "price", product_id,
-        "💵 CHANGE PRICE\n━━━━━━━━━━━━━━━━\n\n"
-        "Send the new USD price.\n\nExample: 3.50"
-    )
-
-
-async def admin_change_name(update, context):
-    product_id = int(update.callback_query.data.split(":", 1)[1])
-    await admin_prompt(
-        update, context, "name", product_id,
-        "✏️ CHANGE PRODUCT NAME\n━━━━━━━━━━━━━━━━\n\n"
-        "Send the new product name."
-    )
-
-
-async def admin_toggle_product(update, context):
-    q = update.callback_query
-    if not await admin_only(update):
-        await q.answer("Admin access required.", show_alert=True)
-        return
-    product_id = int(q.data.split(":", 1)[1])
-    p = admin_get_product(product_id)
-    if not p:
-        await q.answer("Product not found.", show_alert=True)
-        return
-    new_status = 0 if int(p["is_active"]) else 1
-    admin_update_product(product_id, is_active=new_status)
-    admin_log(update.effective_user.id, "toggle_product", "product", product_id, f"is_active={new_status}")
-    await q.answer("Product status updated.")
-    await admin_product_detail(update, context)
-
-
-async def admin_delete_product_prompt(update, context):
-    q = update.callback_query
-    if not await admin_only(update):
-        await q.answer("Admin access required.", show_alert=True)
-        return
-    product_id = int(q.data.split(":", 1)[1])
-    p = admin_get_product(product_id)
-    if not p:
-        await q.answer("Product not found.", show_alert=True)
-        return
-    await q.answer()
-    await q.edit_message_text(
-        f"⚠️ REMOVE PRODUCT\n━━━━━━━━━━━━━━━━\n\n"
-        f"Product: {p['name']}\n\n"
-        "This action will remove the product if it has no stock or order history.\n"
-        "If it has existing data, it will be safely deactivated instead.\n\n"
-        "Are you sure?",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Yes, Remove", callback_data=f"admin_delete_confirm:{product_id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"admin_product:{product_id}")]
-        ])
-    )
-
-
-async def admin_delete_product_confirm(update, context):
-    q = update.callback_query
-    if not await admin_only(update):
-        await q.answer("Admin access required.", show_alert=True)
-        return
-    product_id = int(q.data.split(":", 1)[1])
-    result = admin_delete_product(product_id)
-    admin_log(update.effective_user.id, "remove_product", "product", product_id, result)
-    await q.answer(result, show_alert=True)
-    await admin_products(update, context)
-
-
-async def admin_add_product_prompt(update, context):
-    q = update.callback_query
-    if not await admin_only(update):
-        await q.answer("Admin access required.", show_alert=True)
-        return
-    cats = admin_list_categories()
-    cat_lines = "\n".join([f"{c['id']} = {c['name']}" for c in cats])
-    context.user_data["admin_input"] = {"kind": "add_product"}
-    await q.answer()
-    await q.edit_message_text(
-        "➕ ADD PRODUCT\n━━━━━━━━━━━━━━━━\n\n"
-        "Send the product details in ONE message using:\n\n"
-        "category_id | product_key | product_name | price\n\n"
-        "Example:\n"
-        "1 | gv_new2 | Google Voice New 2 | 3.50\n\n"
-        "Available categories:\n" + cat_lines +
-        "\n\nProduct will be created as Active.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data="admin_products")]
-        ])
-    )
-
-
-async def admin_input_handler(update, context) -> bool:
-    state = context.user_data.get("admin_input")
-    if not state or not update.message or not update.message.text:
-        return False
-    if not await admin_only(update):
-        context.user_data.pop("admin_input", None)
-        return False
-
-    raw = update.message.text.strip()
-    kind = state.get("kind")
-
+def admin_log(admin_telegram_id:int, action:str, target_type:Optional[str]=None,
+              target_id:Optional[int]=None, details:Optional[str]=None):
+    con=get_connection(); cur=con.cursor()
     try:
-        if kind == "price":
-            price = float(raw)
-            if price < 0:
-                raise ValueError("Price cannot be negative.")
-            pid = int(state["product_id"])
-            admin_update_product(pid, price=round(price, 2))
-            admin_log(update.effective_user.id, "change_price", "product", pid, f"price={price:.2f}")
-            context.user_data.pop("admin_input", None)
-            await update.message.reply_text(
-                f"✅ Product price updated to ${price:.2f}.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🛍️ Products", callback_data="admin_products")],
-                    [InlineKeyboardButton("🔐 Admin Panel", callback_data="admin_panel")]
-                ])
-            )
-            return True
-
-        if kind == "name":
-            if len(raw) < 1 or len(raw) > 100:
-                raise ValueError("Name must be 1-100 characters.")
-            pid = int(state["product_id"])
-            admin_update_product(pid, name=raw)
-            admin_log(update.effective_user.id, "change_name", "product", pid, raw)
-            context.user_data.pop("admin_input", None)
-            await update.message.reply_text(
-                "✅ Product name updated.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🛍️ Products", callback_data="admin_products")],
-                    [InlineKeyboardButton("🔐 Admin Panel", callback_data="admin_panel")]
-                ])
-            )
-            return True
-
-        if kind == "add_product":
-            parts = [x.strip() for x in raw.split("|")]
-            if len(parts) != 4:
-                raise ValueError("Use exactly: category_id | product_key | product_name | price")
-            category_id = int(parts[0])
-            key = parts[1]
-            name = parts[2]
-            price = float(parts[3])
-            if not key or not name or price < 0:
-                raise ValueError("Invalid product data.")
-            product_id = admin_create_product(category_id, key, name, price)
-            admin_log(update.effective_user.id, "add_product", "product", product_id, f"{key} / {name}")
-            context.user_data.pop("admin_input", None)
-            await update.message.reply_text(
-                f"✅ Product added successfully.\n\n"
-                f"Product ID: {product_id}\n"
-                f"Name: {name}\n"
-                f"Price: ${price:.2f}\n\n"
-                "It is Active and currently has 0 stock.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🛍️ Products", callback_data="admin_products")],
-                    [InlineKeyboardButton("🔐 Admin Panel", callback_data="admin_panel")]
-                ])
-            )
-            return True
-
-    except Exception as e:
-        await update.message.reply_text(f"❌ {e}\n\nPlease try again or press Cancel.")
-        return True
-
-    return False
+        cur.execute("""INSERT INTO admin_logs(admin_telegram_id,action,target_type,target_id,details)
+                       VALUES(?,?,?,?,?)""",(admin_telegram_id,action,target_type,target_id,details))
+        con.commit()
+    finally: con.close()
 
 
-
-async def admin_command_callback(update, context):
-    q = update.callback_query
-    if not await admin_only(update):
-        await q.answer("Admin access required.", show_alert=True)
-        return
-    await q.answer()
-    await q.edit_message_text(
-        "🔐 ADMIN PANEL\n━━━━━━━━━━━━━━━━\n\nChoose an option:",
-        reply_markup=admin_kb()
-    )
+def database_health_check() -> bool:
+    try:
+        connection=get_connection(); cursor=connection.cursor(); cursor.execute("SELECT 1")
+        result=cursor.fetchone(); connection.close(); return result is not None
+    except Exception: return False
 
 
 # =========================
-# STAGE 5B — STOCK MANAGEMENT
+# STAGE 5B STOCK HELPERS
 # =========================
 
-
-def admin_stock_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📦 Stock Overview", callback_data="admin_stock")],
-        [InlineKeyboardButton("➕ Add Stock", callback_data="admin_stock_add")],
-        [InlineKeyboardButton("🗑️ Remove Bad Stock", callback_data="admin_stock_remove")],
-        [InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel")],
-    ])
-
-
-async def admin_stock_menu(update, context):
-    q=update.callback_query
-    if not await admin_only(update):
-        await q.answer("Admin access required.", show_alert=True); return
-    await q.answer()
-    await q.edit_message_text("📦 STOCK MANAGEMENT\n━━━━━━━━━━━━━━━━\n\nChoose an option:", reply_markup=admin_stock_kb())
-
-
-async def admin_stock_overview(update, context):
-    q=update.callback_query
-    if not await admin_only(update):
-        await q.answer("Admin access required.", show_alert=True); return
-    await q.answer()
-    rows=admin_stock_summary()
-    lines=["📦 STOCK OVERVIEW","━━━━━━━━━━━━━━━━"]
-    if not rows:
-        lines.append("\nNo products found.")
-    else:
-        for r in rows:
-            status="🟢" if int(r["is_active"]) else "🔴"
-            lines.append(f"\n{status} {r['name']}\nAvailable: {r['available_stock']} | Sold: {r['sold_stock']}")
-    kb=[[InlineKeyboardButton("➕ Add Stock",callback_data="admin_stock_add")],
-        [InlineKeyboardButton("🗑️ Remove Bad Stock",callback_data="admin_stock_remove")],
-        [InlineKeyboardButton("🔙 Stock Management",callback_data="admin_stock_menu")]]
-    await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
-
-
-def stock_product_keyboard(products, action):
-    rows=[]
-    for p in products:
-        rows.append([InlineKeyboardButton(f"{p['name']} (available: {p['available_stock']})", callback_data=f"stock_{action}_product:{p['id']}")])
-    rows.append([InlineKeyboardButton("🔙 Stock Management",callback_data="admin_stock_menu")])
-    return InlineKeyboardMarkup(rows)
-
-
-async def admin_stock_add_menu(update, context):
-    q=update.callback_query
-    if not await admin_only(update):
-        await q.answer("Admin access required.", show_alert=True); return
-    await q.answer()
-    products=admin_list_products()
-    await q.edit_message_text("➕ ADD STOCK\n━━━━━━━━━━━━━━━━\n\nSelect the product:", reply_markup=stock_product_keyboard(products,"add"))
-
-
-async def admin_stock_add_product(update, context):
-    q=update.callback_query
-    if not await admin_only(update):
-        await q.answer("Admin access required.", show_alert=True); return
-    product_id=int(q.data.split(":",1)[1])
-    p=admin_get_product(product_id)
-    if not p: await q.answer("Product not found.",show_alert=True); return
-    context.user_data["admin_stock_input"]={"action":"add","product_id":product_id}
-    await q.answer()
-    await q.edit_message_text(
-        f"➕ ADD STOCK\n━━━━━━━━━━━━━━━━\n\nProduct: {p['name']}\n\n"
-        "Send stock items as separate lines.\n"
-        "For account stock, you can use: email,password\n"
-        "Example:\n"
-        "user1@example.com,password1\n"
-        "user2@example.com,password2\n\n"
-        "Each line becomes one stock item.\n"
-        "You can paste many lines at once.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_stock_menu")]])
-    )
-
-
-async def admin_stock_remove_menu(update, context):
-    q=update.callback_query
-    if not await admin_only(update):
-        await q.answer("Admin access required.", show_alert=True); return
-    await q.answer()
-    products=admin_list_products()
-    await q.edit_message_text("🗑️ REMOVE BAD STOCK\n━━━━━━━━━━━━━━━━\n\nSelect the product:", reply_markup=stock_product_keyboard(products,"remove"))
-
-
-async def admin_stock_remove_product(update, context):
-    q=update.callback_query
-    if not await admin_only(update):
-        await q.answer("Admin access required.", show_alert=True); return
-    product_id=int(q.data.split(":",1)[1])
-    p=admin_get_product(product_id)
-    if not p: await q.answer("Product not found.",show_alert=True); return
-    items=admin_stock_items(product_id,"available",50)
-    if not items:
-        await q.answer("No available stock.",show_alert=True); return
-    rows=[]
-    for item in items:
-        content=str(item["stock_content"])
-        preview=content.replace("\n"," ")[:45]
-        rows.append([InlineKeyboardButton(f"#{item['id']} {preview}",callback_data=f"admin_stock_remove_item:{item['id']}")])
-    rows.append([InlineKeyboardButton("🔙 Back",callback_data="admin_stock_remove")])
-    await q.answer()
-    await q.edit_message_text(f"🗑️ REMOVE BAD STOCK\n━━━━━━━━━━━━━━━━\n\nProduct: {p['name']}\n\nSelect the stock item to remove:",reply_markup=InlineKeyboardMarkup(rows))
-
-
-async def admin_stock_remove_item(update, context):
-    q=update.callback_query
-    if not await admin_only(update):
-        await q.answer("Admin access required.",show_alert=True); return
-    stock_id=int(q.data.split(":",1)[1])
-    item=admin_stock_items(None,"available",1,stock_id=stock_id)
-    if not item:
-        await q.answer("Stock item not found.",show_alert=True); return
-    row=item[0]
-    await q.answer()
-    await q.edit_message_text(
-        f"⚠️ REMOVE STOCK ITEM\n━━━━━━━━━━━━━━━━\n\nStock ID: #{row['id']}\nProduct: {row['product_name']}\n\n{row['stock_content']}\n\nRemove this item?",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Yes, Remove",callback_data=f"admin_stock_remove_confirm:{stock_id}")],
-            [InlineKeyboardButton("❌ Cancel",callback_data=f"stock_remove_product:{row['product_id']}")]
-        ])
-    )
-
-
-async def admin_stock_remove_confirm(update, context):
-    q=update.callback_query
-    if not await admin_only(update):
-        await q.answer("Admin access required.",show_alert=True); return
-    stock_id=int(q.data.split(":",1)[1])
-    result=admin_remove_stock(stock_id,update.effective_user.id)
-    await q.answer(result,show_alert=True)
-    await admin_stock_menu(update,context)
-
-
-async def admin_stock_input_handler(update, context):
-    state=context.user_data.get("admin_stock_input")
-    if not state or not update.message or not update.message.text:
-        return False
-    if not await admin_only(update):
-        context.user_data.pop("admin_stock_input",None); return False
-    raw=update.message.text.strip()
-    if raw.lower() in {"cancel","/cancel"}:
-        context.user_data.pop("admin_stock_input",None)
-        await update.message.reply_text("❌ Stock operation cancelled.",reply_markup=admin_kb()); return True
-    if state["action"]!="add": return False
-    lines=[x.strip() for x in raw.splitlines() if x.strip()]
-    if not lines:
-        await update.message.reply_text("❌ No stock items found. Paste one stock item per line."); return True
-    if len(lines)>500:
-        await update.message.reply_text("❌ Maximum 500 stock items per upload. Split the stock into smaller batches."); return True
+def admin_stock_summary():
+    con=get_connection(); cur=con.cursor()
     try:
-        added=admin_add_stock(state["product_id"],lines,update.effective_user.id)
-        context.user_data.pop("admin_stock_input",None)
-        await update.message.reply_text(f"✅ Stock added successfully.\n\nAdded: {added} item(s).",reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📦 Stock Overview",callback_data="admin_stock")],
-            [InlineKeyboardButton("🔐 Admin Panel",callback_data="admin_panel")]
-        ]))
-    except Exception as e:
-        await update.message.reply_text(f"❌ {e}")
-    return True
-
-async def error_handler(update,context): print("Bot error:",context.error)
+        return cur.execute("""SELECT p.id,p.name,p.is_active,
+            (SELECT COUNT(*) FROM stock s WHERE s.product_id=p.id AND s.status='available') AS available_stock,
+            (SELECT COUNT(*) FROM stock s WHERE s.product_id=p.id AND s.status='sold') AS sold_stock
+            FROM products p ORDER BY p.id""").fetchall()
+    finally: con.close()
 
 
-def main():
-    if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN is missing. Please add BOT_TOKEN in Railway Variables.")
-    init_db()
-    application=Application.builder().token(BOT_TOKEN).build()
+def admin_stock_items(product_id=None, status="available", limit=50, stock_id=None):
+    con=get_connection(); cur=con.cursor()
+    try:
+        if stock_id is not None:
+            return cur.execute("""SELECT s.*,p.name AS product_name FROM stock s JOIN products p ON p.id=s.product_id
+                                 WHERE s.id=? AND s.status=?""",(stock_id,status)).fetchall()
+        if product_id is None:
+            return cur.execute("""SELECT s.*,p.name AS product_name FROM stock s JOIN products p ON p.id=s.product_id
+                                 WHERE s.status=? ORDER BY s.id DESC LIMIT ?""",(status,limit)).fetchall()
+        return cur.execute("""SELECT s.*,p.name AS product_name FROM stock s JOIN products p ON p.id=s.product_id
+                             WHERE s.product_id=? AND s.status=? ORDER BY s.id ASC LIMIT ?""",(product_id,status,limit)).fetchall()
+    finally: con.close()
 
-    application.add_handler(CommandHandler("start",start))
-    application.add_handler(CommandHandler("pending_payments",pending_payments))
-    application.add_handler(CommandHandler("approve_payment",approve_payment_cmd))
-    application.add_handler(CommandHandler("cancel_payment",cancel_payment_cmd))
-    application.add_handler(CommandHandler("admin",admin_command))
 
-    application.add_handler(CallbackQueryHandler(admin_command_callback,pattern="^admin_panel$"))
-    application.add_handler(CallbackQueryHandler(admin_dashboard,pattern="^admin_dashboard$"))
-    application.add_handler(CallbackQueryHandler(admin_products_callback,pattern="^admin_products$"))
-    application.add_handler(CallbackQueryHandler(admin_products_page,pattern="^admin_products_page:"))
-    application.add_handler(CallbackQueryHandler(admin_product_detail,pattern="^admin_product:"))
-    application.add_handler(CallbackQueryHandler(admin_change_price,pattern="^admin_price:"))
-    application.add_handler(CallbackQueryHandler(admin_change_name,pattern="^admin_name:"))
-    application.add_handler(CallbackQueryHandler(admin_toggle_product,pattern="^admin_toggle:"))
-    application.add_handler(CallbackQueryHandler(admin_delete_product_prompt,pattern="^admin_delete:"))
-    application.add_handler(CallbackQueryHandler(admin_delete_product_confirm,pattern="^admin_delete_confirm:"))
-    application.add_handler(CallbackQueryHandler(admin_add_product_prompt,pattern="^admin_add_product$"))
-    application.add_handler(CallbackQueryHandler(admin_stock_menu,pattern="^admin_stock_menu$"))
-    application.add_handler(CallbackQueryHandler(admin_stock_overview,pattern="^admin_stock$"))
-    application.add_handler(CallbackQueryHandler(admin_stock_add_menu,pattern="^admin_stock_add$"))
-    application.add_handler(CallbackQueryHandler(admin_stock_add_product,pattern="^stock_add_product:"))
-    application.add_handler(CallbackQueryHandler(admin_stock_remove_menu,pattern="^admin_stock_remove$"))
-    application.add_handler(CallbackQueryHandler(admin_stock_remove_product,pattern="^stock_remove_product:"))
-    application.add_handler(CallbackQueryHandler(admin_stock_remove_item,pattern="^admin_stock_remove_item:"))
-    application.add_handler(CallbackQueryHandler(admin_stock_remove_confirm,pattern="^admin_stock_remove_confirm:"))
+def admin_add_stock(product_id:int, contents, admin_telegram_id:int):
+    if not contents: raise ValueError("No stock supplied.")
+    con=get_connection(); cur=con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        p=cur.execute("SELECT id,name FROM products WHERE id=?",(product_id,)).fetchone()
+        if not p: raise ValueError("Product not found.")
+        count=0
+        for content in contents:
+            value=str(content).strip()
+            if not value: continue
+            cur.execute("INSERT INTO stock(product_id,stock_content,status) VALUES(?,?,'available')",(product_id,value))
+            count+=1
+        if count==0: raise ValueError("No valid stock items supplied.")
+        cur.execute("INSERT INTO admin_logs(admin_telegram_id,action,target_type,target_id,details) VALUES(?,?,?,?,?)",
+                    (admin_telegram_id,"add_stock","product",product_id,f"added={count}"))
+        con.commit(); return count
+    except Exception:
+        con.rollback(); raise
+    finally: con.close()
 
-    application.add_handler(CallbackQueryHandler(show_main_menu,pattern="^main_menu$"))
-    application.add_handler(CallbackQueryHandler(show_profile,pattern="^my_profile$"))
-    application.add_handler(CallbackQueryHandler(communication_apps,pattern="^communication_apps$"))
-    application.add_handler(CallbackQueryHandler(google_voice,pattern="^google_voice$"))
-    application.add_handler(CallbackQueryHandler(textnow,pattern="^textnow$"))
-    application.add_handler(CallbackQueryHandler(textfree,pattern="^textfree$"))
-    application.add_handler(CallbackQueryHandler(sideline,pattern="^sideline$"))
-    application.add_handler(CallbackQueryHandler(talkatone,pattern="^talkatone$"))
-    application.add_handler(CallbackQueryHandler(textplus,pattern="^textplus$"))
-    application.add_handler(CallbackQueryHandler(custom_quantity_prompt,pattern="^customqty:"))
-    application.add_handler(CallbackQueryHandler(cancel_custom_quantity,pattern="^cancelcustomqty:"))
-    application.add_handler(CallbackQueryHandler(quantity_selected,pattern="^buyqty:"))
-    application.add_handler(CallbackQueryHandler(confirm_buy,pattern="^confirmbuy:"))
-    application.add_handler(CallbackQueryHandler(pay_purchase,pattern="^paypurchase:"))
-    application.add_handler(CallbackQueryHandler(enter_payment,pattern="^enterpay:"))
-    application.add_handler(CallbackQueryHandler(cancel_user_payment,pattern="^cancel_user_payment:"))
-    application.add_handler(CallbackQueryHandler(communication_product,pattern="^product_"))
-    application.add_handler(CallbackQueryHandler(buy_vpn,pattern="^buy_vpn$"))
-    application.add_handler(CallbackQueryHandler(vpn_03_days,pattern="^vpn_03_days$"))
-    application.add_handler(CallbackQueryHandler(vpn_07_days,pattern="^vpn_07_days$"))
-    application.add_handler(CallbackQueryHandler(vpn_07_page_2,pattern="^vpn_07_page_2$"))
-    application.add_handler(CallbackQueryHandler(vpn_07_page_3,pattern="^vpn_07_page_3$"))
-    application.add_handler(CallbackQueryHandler(vpn_14_days,pattern="^vpn_14_days$"))
-    application.add_handler(CallbackQueryHandler(vpn_30_days,pattern="^vpn_30_days$"))
-    application.add_handler(CallbackQueryHandler(vpn_product,pattern="^vpn_product_"))
-    application.add_handler(CallbackQueryHandler(buy_proxy,pattern="^buy_proxy$"))
-    application.add_handler(CallbackQueryHandler(verification_service,pattern="^verification_service$"))
-    application.add_handler(CallbackQueryHandler(buy_more_products,pattern="^buy_more_products$"))
-    application.add_handler(CallbackQueryHandler(coming_soon,pattern="^coming_soon_"))
-    application.add_handler(CallbackQueryHandler(add_balance,pattern="^add_balance$"))
-    application.add_handler(CallbackQueryHandler(my_orders,pattern="^my_orders$"))
-    application.add_handler(CallbackQueryHandler(refer,pattern="^refer$"))
-    application.add_handler(CallbackQueryHandler(support,pattern="^support$"))
 
-    # Text handler first checks active payment/amount states.
-    async def text_router(update,context):
-        if await admin_stock_input_handler(update,context): return
-        if await admin_input_handler(update,context): return
-        if await process_custom_quantity(update,context): return
-        if await add_balance_text_handler(update,context): return
-        await text_message_handler(update,context)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_router))
-    application.add_error_handler(error_handler)
-
-    print(f"{STORE_NAME} Stage 5B bot is running...")
-    application.run_polling()
-
-if __name__ == "__main__": main()
+def admin_remove_stock(stock_id:int, admin_telegram_id:int):
+    con=get_connection(); cur=con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        item=cur.execute("SELECT id,product_id,status FROM stock WHERE id=?",(stock_id,)).fetchone()
+        if not item: raise ValueError("Stock item not found.")
+        if item["status"]!="available": raise ValueError("Only available stock can be removed.")
+        cur.execute("UPDATE stock SET status='removed',sold_at=NULL WHERE id=? AND status='available'",(stock_id,))
+        if cur.rowcount!=1: raise ValueError("Stock item could not be removed.")
+        cur.execute("INSERT INTO admin_logs(admin_telegram_id,action,target_type,target_id,details) VALUES(?,?,?,?,?)",
+                    (admin_telegram_id,"remove_stock","stock",stock_id,"removed bad/unwanted stock"))
+        con.commit(); return "Stock removed successfully."
+    except Exception:
+        con.rollback(); raise
+    finally: con.close()
