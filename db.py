@@ -314,8 +314,9 @@ def submit_payment_reference(payment_id:int, transaction_id:str):
 
 
 def _complete_purchase_locked(cursor, intent_id:int, payment_id:Optional[int]=None, confirmed_by:Optional[int]=None):
-    intent=cursor.execute("""SELECT pi.*,u.telegram_id,u.balance,p.name,p.price FROM purchase_intents pi
-                            JOIN users u ON u.id=pi.user_id JOIN products p ON p.id=pi.product_id WHERE pi.id=?""",(intent_id,)).fetchone()
+    intent=cursor.execute("""SELECT pi.*,u.telegram_id,u.balance,p.name,p.price,p.product_type,c.name AS category_name FROM purchase_intents pi
+                            JOIN users u ON u.id=pi.user_id JOIN products p ON p.id=pi.product_id
+                            LEFT JOIN categories c ON c.id=p.category_id WHERE pi.id=?""",(intent_id,)).fetchone()
     if not intent: raise ValueError("Purchase intent not found.")
     if intent["status"]=="completed":
         return {"already_completed":True,"order_id":intent["order_id"],"telegram_id":intent["telegram_id"],"delivered":[]}
@@ -338,7 +339,8 @@ def _complete_purchase_locked(cursor, intent_id:int, payment_id:Optional[int]=No
         cursor.execute("INSERT INTO order_items(order_id,stock_id,delivered_content) VALUES(?,?,?)",(order_id,item["id"],item["stock_content"]))
         delivered.append(item["stock_content"])
     cursor.execute("UPDATE purchase_intents SET status='completed',order_id=?,updated_at=CURRENT_TIMESTAMP,completed_at=CURRENT_TIMESTAMP WHERE id=?",(order_id,intent_id))
-    return {"already_completed":False,"order_id":order_id,"telegram_id":intent["telegram_id"],"delivered":delivered,"total":total,"balance_after":after,"product_name":intent["name"],"quantity":quantity}
+    return {"already_completed":False,"order_id":order_id,"telegram_id":intent["telegram_id"],"delivered":delivered,"total":total,"balance_after":after,"product_name":intent["name"],"quantity":quantity,
+            "product_type":intent["product_type"],"category_name":intent["category_name"]}
 
 
 def complete_purchase(intent_id:int):
@@ -538,3 +540,70 @@ def database_health_check() -> bool:
         connection=get_connection(); cursor=connection.cursor(); cursor.execute("SELECT 1")
         result=cursor.fetchone(); connection.close(); return result is not None
     except Exception: return False
+
+
+# =========================
+# STAGE 5B STOCK HELPERS
+# =========================
+
+def admin_stock_summary():
+    con=get_connection(); cur=con.cursor()
+    try:
+        return cur.execute("""SELECT p.id,p.name,p.is_active,
+            (SELECT COUNT(*) FROM stock s WHERE s.product_id=p.id AND s.status='available') AS available_stock,
+            (SELECT COUNT(*) FROM stock s WHERE s.product_id=p.id AND s.status='sold') AS sold_stock
+            FROM products p ORDER BY p.id""").fetchall()
+    finally: con.close()
+
+
+def admin_stock_items(product_id=None, status="available", limit=50, stock_id=None):
+    con=get_connection(); cur=con.cursor()
+    try:
+        if stock_id is not None:
+            return cur.execute("""SELECT s.*,p.name AS product_name FROM stock s JOIN products p ON p.id=s.product_id
+                                 WHERE s.id=? AND s.status=?""",(stock_id,status)).fetchall()
+        if product_id is None:
+            return cur.execute("""SELECT s.*,p.name AS product_name FROM stock s JOIN products p ON p.id=s.product_id
+                                 WHERE s.status=? ORDER BY s.id DESC LIMIT ?""",(status,limit)).fetchall()
+        return cur.execute("""SELECT s.*,p.name AS product_name FROM stock s JOIN products p ON p.id=s.product_id
+                             WHERE s.product_id=? AND s.status=? ORDER BY s.id ASC LIMIT ?""",(product_id,status,limit)).fetchall()
+    finally: con.close()
+
+
+def admin_add_stock(product_id:int, contents, admin_telegram_id:int):
+    if not contents: raise ValueError("No stock supplied.")
+    con=get_connection(); cur=con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        p=cur.execute("SELECT id,name FROM products WHERE id=?",(product_id,)).fetchone()
+        if not p: raise ValueError("Product not found.")
+        count=0
+        for content in contents:
+            value=str(content).strip()
+            if not value: continue
+            cur.execute("INSERT INTO stock(product_id,stock_content,status) VALUES(?,?,'available')",(product_id,value))
+            count+=1
+        if count==0: raise ValueError("No valid stock items supplied.")
+        cur.execute("INSERT INTO admin_logs(admin_telegram_id,action,target_type,target_id,details) VALUES(?,?,?,?,?)",
+                    (admin_telegram_id,"add_stock","product",product_id,f"added={count}"))
+        con.commit(); return count
+    except Exception:
+        con.rollback(); raise
+    finally: con.close()
+
+
+def admin_remove_stock(stock_id:int, admin_telegram_id:int):
+    con=get_connection(); cur=con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        item=cur.execute("SELECT id,product_id,status FROM stock WHERE id=?",(stock_id,)).fetchone()
+        if not item: raise ValueError("Stock item not found.")
+        if item["status"]!="available": raise ValueError("Only available stock can be removed.")
+        cur.execute("UPDATE stock SET status='removed',sold_at=NULL WHERE id=? AND status='available'",(stock_id,))
+        if cur.rowcount!=1: raise ValueError("Stock item could not be removed.")
+        cur.execute("INSERT INTO admin_logs(admin_telegram_id,action,target_type,target_id,details) VALUES(?,?,?,?,?)",
+                    (admin_telegram_id,"remove_stock","stock",stock_id,"removed bad/unwanted stock"))
+        con.commit(); return "Stock removed successfully."
+    except Exception:
+        con.rollback(); raise
+    finally: con.close()
