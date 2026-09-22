@@ -562,6 +562,108 @@ def database_health_check() -> bool:
     except Exception: return False
 
 
+
+# =========================
+# STAGE 5C — ADMIN ORDERS + CUSTOMERS
+# =========================
+
+def admin_recent_orders(limit: int = 30):
+    con=get_connection(); cur=con.cursor()
+    try:
+        return cur.execute("""SELECT o.*, u.telegram_id, u.username, u.first_name, p.name AS product_name
+            FROM orders o JOIN users u ON u.id=o.user_id JOIN products p ON p.id=o.product_id
+            ORDER BY o.id DESC LIMIT ?""",(limit,)).fetchall()
+    finally: con.close()
+
+
+def admin_get_order(order_id: int):
+    con=get_connection(); cur=con.cursor()
+    try:
+        return cur.execute("""SELECT o.*, u.telegram_id, u.username, u.first_name, u.last_name,
+            p.name AS product_name, p.product_key
+            FROM orders o JOIN users u ON u.id=o.user_id JOIN products p ON p.id=o.product_id
+            WHERE o.id=?""",(order_id,)).fetchone()
+    finally: con.close()
+
+
+def admin_order_items(order_id: int):
+    con=get_connection(); cur=con.cursor()
+    try:
+        return cur.execute("""SELECT oi.*, s.status AS stock_status
+            FROM order_items oi LEFT JOIN stock s ON s.id=oi.stock_id
+            WHERE oi.order_id=? ORDER BY oi.id ASC""",(order_id,)).fetchall()
+    finally: con.close()
+
+
+def admin_list_users(limit: int = 30, search: str = ""):
+    con=get_connection(); cur=con.cursor()
+    try:
+        if search:
+            q="%"+str(search).strip()+"%"
+            return cur.execute("""SELECT u.*,
+                (SELECT COUNT(*) FROM orders o WHERE o.user_id=u.id) AS order_count,
+                (SELECT COALESCE(SUM(o.total_amount),0) FROM orders o WHERE o.user_id=u.id AND o.status='completed') AS total_spent
+                FROM users u
+                WHERE CAST(u.telegram_id AS TEXT) LIKE ? OR COALESCE(u.username,'') LIKE ?
+                   OR COALESCE(u.first_name,'') LIKE ? OR COALESCE(u.last_name,'') LIKE ?
+                ORDER BY u.id DESC LIMIT ?""",(q,q,q,q,limit)).fetchall()
+        return cur.execute("""SELECT u.*,
+            (SELECT COUNT(*) FROM orders o WHERE o.user_id=u.id) AS order_count,
+            (SELECT COALESCE(SUM(o.total_amount),0) FROM orders o WHERE o.user_id=u.id AND o.status='completed') AS total_spent
+            FROM users u ORDER BY u.id DESC LIMIT ?""",(limit,)).fetchall()
+    finally: con.close()
+
+
+def admin_get_user_by_db_id(user_id: int):
+    con=get_connection(); cur=con.cursor()
+    try:
+        return cur.execute("""SELECT u.*,
+            (SELECT COUNT(*) FROM orders o WHERE o.user_id=u.id) AS order_count,
+            (SELECT COALESCE(SUM(o.total_amount),0) FROM orders o WHERE o.user_id=u.id AND o.status='completed') AS total_spent
+            FROM users u WHERE u.id=?""",(user_id,)).fetchone()
+    finally: con.close()
+
+
+def admin_set_user_blocked(user_id: int, blocked: bool, admin_telegram_id: int):
+    con=get_connection(); cur=con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        row=cur.execute("SELECT id FROM users WHERE id=?",(user_id,)).fetchone()
+        if not row: raise ValueError("Customer not found.")
+        cur.execute("UPDATE users SET is_blocked=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(1 if blocked else 0,user_id))
+        cur.execute("INSERT INTO admin_logs(admin_telegram_id,action,target_type,target_id,details) VALUES(?,?,?,?,?)",
+                    (admin_telegram_id,"block_user" if blocked else "unblock_user","user",user_id,"blocked" if blocked else "unblocked"))
+        con.commit()
+    except Exception:
+        con.rollback(); raise
+    finally: con.close()
+
+
+def admin_remove_user(user_id: int, admin_telegram_id: int):
+    con=get_connection(); cur=con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        row=cur.execute("SELECT id,telegram_id FROM users WHERE id=?",(user_id,)).fetchone()
+        if not row: raise ValueError("Customer not found.")
+        checks=[
+            ("orders", "SELECT 1 FROM orders WHERE user_id=? LIMIT 1"),
+            ("payments", "SELECT 1 FROM payments WHERE user_id=? LIMIT 1"),
+            ("balance transactions", "SELECT 1 FROM balance_transactions WHERE user_id=? LIMIT 1"),
+            ("referral records", "SELECT 1 FROM referral_commissions WHERE referrer_id=? OR referred_user_id=? LIMIT 1"),
+        ]
+        for name,sql in checks:
+            params=(user_id,user_id) if name=="referral records" else (user_id,)
+            if cur.execute(sql,params).fetchone():
+                raise ValueError(f"Customer has existing {name}; block the customer instead of deleting the account.")
+        cur.execute("DELETE FROM users WHERE id=?",(user_id,))
+        cur.execute("INSERT INTO admin_logs(admin_telegram_id,action,target_type,target_id,details) VALUES(?,?,?,?,?)",
+                    (admin_telegram_id,"remove_user","user",user_id,f"telegram_id={row['telegram_id']}"))
+        con.commit()
+        return True
+    except Exception:
+        con.rollback(); raise
+    finally: con.close()
+
 # =========================
 # STAGE 5B STOCK HELPERS
 # =========================
@@ -702,4 +804,51 @@ def admin_remove_stock(stock_id:int, admin_telegram_id:int):
         con.commit(); return "Stock removed successfully."
     except Exception:
         con.rollback(); raise
+    finally: con.close()
+
+# STAGE 5C — ADMIN ORDERS + CUSTOMERS
+def admin_recent_orders(limit=30):
+    con=get_connection(); cur=con.cursor()
+    try: return cur.execute("SELECT o.*,u.telegram_id,u.username,u.first_name,p.name AS product_name FROM orders o JOIN users u ON u.id=o.user_id JOIN products p ON p.id=o.product_id ORDER BY o.id DESC LIMIT ?",(limit,)).fetchall()
+    finally: con.close()
+def admin_get_order(order_id):
+    con=get_connection(); cur=con.cursor()
+    try: return cur.execute("SELECT o.*,u.telegram_id,u.username,u.first_name,u.last_name,p.name AS product_name,p.product_key FROM orders o JOIN users u ON u.id=o.user_id JOIN products p ON p.id=o.product_id WHERE o.id=?",(order_id,)).fetchone()
+    finally: con.close()
+def admin_order_items(order_id):
+    con=get_connection(); cur=con.cursor()
+    try: return cur.execute("SELECT oi.*,s.status AS stock_status FROM order_items oi LEFT JOIN stock s ON s.id=oi.stock_id WHERE oi.order_id=? ORDER BY oi.id",(order_id,)).fetchall()
+    finally: con.close()
+def admin_list_users(limit=30, search=""):
+    con=get_connection(); cur=con.cursor()
+    try:
+        base="SELECT u.*,(SELECT COUNT(*) FROM orders o WHERE o.user_id=u.id) AS order_count,(SELECT COALESCE(SUM(o.total_amount),0) FROM orders o WHERE o.user_id=u.id AND o.status='completed') AS total_spent FROM users u"
+        if search:
+            q="%"+str(search).strip()+"%"
+            return cur.execute(base+" WHERE CAST(u.telegram_id AS TEXT) LIKE ? OR COALESCE(u.username,'') LIKE ? OR COALESCE(u.first_name,'') LIKE ? OR COALESCE(u.last_name,'') LIKE ? ORDER BY u.id DESC LIMIT ?",(q,q,q,q,limit)).fetchall()
+        return cur.execute(base+" ORDER BY u.id DESC LIMIT ?",(limit,)).fetchall()
+    finally: con.close()
+def admin_get_user_by_db_id(user_id):
+    con=get_connection(); cur=con.cursor()
+    try: return cur.execute("SELECT u.*,(SELECT COUNT(*) FROM orders o WHERE o.user_id=u.id) AS order_count,(SELECT COALESCE(SUM(o.total_amount),0) FROM orders o WHERE o.user_id=u.id AND o.status='completed') AS total_spent FROM users u WHERE u.id=?",(user_id,)).fetchone()
+    finally: con.close()
+def admin_set_user_blocked(user_id, blocked, admin_telegram_id):
+    con=get_connection(); cur=con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        if not cur.execute("SELECT id FROM users WHERE id=?",(user_id,)).fetchone(): raise ValueError("Customer not found.")
+        cur.execute("UPDATE users SET is_blocked=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(1 if blocked else 0,user_id))
+        cur.execute("INSERT INTO admin_logs(admin_telegram_id,action,target_type,target_id,details) VALUES(?,?,?,?,?)",(admin_telegram_id,"block_user" if blocked else "unblock_user","user",user_id,"")); con.commit()
+    except Exception: con.rollback(); raise
+    finally: con.close()
+def admin_remove_user(user_id, admin_telegram_id):
+    con=get_connection(); cur=con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE"); row=cur.execute("SELECT id,telegram_id FROM users WHERE id=?",(user_id,)).fetchone()
+        if not row: raise ValueError("Customer not found.")
+        checks=[("orders","SELECT 1 FROM orders WHERE user_id=? LIMIT 1",(user_id,)),("payments","SELECT 1 FROM payments WHERE user_id=? LIMIT 1",(user_id,)),("balance transactions","SELECT 1 FROM balance_transactions WHERE user_id=? LIMIT 1",(user_id,)),("referral records","SELECT 1 FROM referral_commissions WHERE referrer_id=? OR referred_user_id=? LIMIT 1",(user_id,user_id))]
+        for name,sql,args in checks:
+            if cur.execute(sql,args).fetchone(): raise ValueError(f"Customer has existing {name}; block the customer instead of deleting the account.")
+        cur.execute("DELETE FROM users WHERE id=?",(user_id,)); cur.execute("INSERT INTO admin_logs(admin_telegram_id,action,target_type,target_id,details) VALUES(?,?,?,?,?)",(admin_telegram_id,"remove_user","user",user_id,f"telegram_id={row['telegram_id']}")); con.commit()
+    except Exception: con.rollback(); raise
     finally: con.close()
