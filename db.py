@@ -580,6 +580,8 @@ def admin_add_stock_field(product_id:int, field_name:str, admin_telegram_id:int)
     name=str(field_name or "").strip()
     if not name: raise ValueError("Field name cannot be empty.")
     if len(name)>50: raise ValueError("Field name must be 1-50 characters.")
+    if any(ch in name for ch in [",", "\t", "|"]):
+        raise ValueError("Field name cannot contain comma, TAB, or | because those are stock separators.")
     con=get_connection(); cur=con.cursor()
     try:
         cur.execute("BEGIN IMMEDIATE")
@@ -603,6 +605,8 @@ def admin_rename_stock_field(field_id:int, field_name:str, admin_telegram_id:int
     name=str(field_name or "").strip()
     if not name: raise ValueError("Field name cannot be empty.")
     if len(name)>50: raise ValueError("Field name must be 1-50 characters.")
+    if any(ch in name for ch in [",", "\t", "|"]):
+        raise ValueError("Field name cannot contain comma, TAB, or | because those are stock separators.")
     con=get_connection(); cur=con.cursor()
     try:
         cur.execute("BEGIN IMMEDIATE")
