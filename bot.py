@@ -19,6 +19,8 @@ from db import (
     admin_create_product, admin_update_product, admin_delete_product,
     admin_list_categories, admin_log,
     admin_stock_summary, admin_stock_items, admin_add_stock, admin_remove_stock,
+    admin_recent_orders, admin_get_order, admin_order_items, admin_list_users, admin_get_user_by_db_id,
+    admin_set_user_blocked, admin_remove_user,
     admin_get_stock_fields, admin_add_stock_field, admin_rename_stock_field, admin_remove_stock_field,
 )
 
@@ -650,6 +652,8 @@ def admin_kb():
         [InlineKeyboardButton("📊 Dashboard", callback_data="admin_dashboard")],
         [InlineKeyboardButton("🛍️ Products", callback_data="admin_products")],
         [InlineKeyboardButton("📦 Stock Management", callback_data="admin_stock_menu")],
+        [InlineKeyboardButton("📦 Orders", callback_data="admin_orders")],
+        [InlineKeyboardButton("👥 Customers", callback_data="admin_customers")],
         [InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")],
     ])
 
@@ -976,6 +980,72 @@ async def admin_command_callback(update, context):
         reply_markup=admin_kb()
     )
 
+
+
+# STAGE 5C — ORDERS + CUSTOMERS
+def admin_orders_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📦 Recent Orders",callback_data="admin_orders")],[InlineKeyboardButton("👥 Customers",callback_data="admin_customers")],[InlineKeyboardButton("🔙 Admin Panel",callback_data="admin_panel")]])
+async def admin_orders(update,context):
+    q=update.callback_query
+    if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
+    await q.answer(); rows=admin_recent_orders(30); lines=["📦 ORDERS — RECENT","━━━━━━━━━━━━━━━━"]; kb=[]
+    if not rows: lines.append("No orders found.")
+    for r in rows:
+        status="✅" if r["status"]=="completed" else "⏳"; lines.append(f"#{r['id']} — {r['product_name']} x{r['quantity']} — ${float(r['total_amount']):.2f} — {status}"); kb.append([InlineKeyboardButton(f"🔎 Order #{r['id']}",callback_data=f"admin_order:{r['id']}")])
+    kb += [[InlineKeyboardButton("👥 Customers",callback_data="admin_customers")],[InlineKeyboardButton("🔙 Admin Panel",callback_data="admin_panel")]]
+    await q.edit_message_text("\n".join(lines),reply_markup=InlineKeyboardMarkup(kb))
+async def admin_order_detail(update,context):
+    q=update.callback_query
+    if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
+    oid=int(q.data.split(":",1)[1]); o=admin_get_order(oid)
+    if not o: await q.answer("Order not found.",show_alert=True); return
+    await q.answer(); user=f"@{o['username']}" if o['username'] else str(o['telegram_id'])
+    lines=["📦 ORDER DETAILS","━━━━━━━━━━━━━━━━",f"Order: #{o['id']}",f"User: {user}",f"Telegram ID: {o['telegram_id']}",f"Product: {o['product_name']}",f"Quantity: {o['quantity']}",f"Unit Price: ${float(o['unit_price']):.2f}",f"Total: ${float(o['total_amount']):.2f}",f"Status: {o['status']}",f"Delivery: {o['delivery_status']}",f"Created: {o['created_at']}"]
+    items=admin_order_items(oid)
+    if items:
+        lines.append("Delivered items:")
+        for i,it in enumerate(items,1): lines.append(f"{i}. {str(it['delivered_content'] or '')[:100]}")
+    await q.edit_message_text("\n".join(lines),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Orders",callback_data="admin_orders")],[InlineKeyboardButton("🔐 Admin Panel",callback_data="admin_panel")]]))
+def admin_customers_kb(rows):
+    kb=[]
+    for u in rows:
+        name=f"@{u['username']}" if u['username'] else (u['first_name'] or str(u['telegram_id'])); flag="🚫" if int(u['is_blocked']) else "👤"; kb.append([InlineKeyboardButton(f"{flag} {name} · {u['telegram_id']}",callback_data=f"admin_customer:{u['id']}")])
+    kb += [[InlineKeyboardButton("🔍 Search Customer",callback_data="admin_customer_search")],[InlineKeyboardButton("📦 Orders",callback_data="admin_orders")],[InlineKeyboardButton("🔙 Admin Panel",callback_data="admin_panel")]]; return InlineKeyboardMarkup(kb)
+async def admin_customers(update,context):
+    q=update.callback_query
+    if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
+    await q.answer(); rows=admin_list_users(30); await q.edit_message_text("👥 CUSTOMERS\n━━━━━━━━━━━━━━━━\n\nRecent customers: "+str(len(rows)),reply_markup=admin_customers_kb(rows))
+async def admin_customer_detail(update,context):
+    q=update.callback_query
+    if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
+    uid=int(q.data.split(":",1)[1]); u=admin_get_user_by_db_id(uid)
+    if not u: await q.answer("Customer not found.",show_alert=True); return
+    await q.answer(); status="🚫 BLOCKED" if int(u['is_blocked']) else "🟢 ACTIVE"; username=f"@{u['username']}" if u['username'] else "N/A"
+    lines=["👤 CUSTOMER DETAILS","━━━━━━━━━━━━━━━━",f"Telegram ID: {u['telegram_id']}",f"Username: {username}",f"Name: {(u['first_name'] or '')} {(u['last_name'] or '')}",f"Status: {status}",f"Balance: ${float(u['balance']):.2f}",f"Orders: {u['order_count']}",f"Total spent: ${float(u['total_spent']):.2f}",f"Referrals: {u['total_referrals']}",f"Referral income: ${float(u['referral_income']):.2f}"]
+    toggle="🔓 Unblock" if int(u['is_blocked']) else "🚫 Block"; kb=[[InlineKeyboardButton(toggle,callback_data=f"admin_customer_block:{uid}")],[InlineKeyboardButton("🗑️ Remove Customer",callback_data=f"admin_customer_remove:{uid}")],[InlineKeyboardButton("🔙 Customers",callback_data="admin_customers")],[InlineKeyboardButton("🔐 Admin Panel",callback_data="admin_panel")]]
+    await q.edit_message_text("\n".join(lines),reply_markup=InlineKeyboardMarkup(kb))
+async def admin_customer_block(update,context):
+    q=update.callback_query
+    if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
+    uid=int(q.data.split(":",1)[1]); u=admin_get_user_by_db_id(uid)
+    if not u: await q.answer("Customer not found.",show_alert=True); return
+    blocked=not bool(int(u['is_blocked'])); admin_set_user_blocked(uid,blocked,update.effective_user.id); await q.answer("Customer blocked." if blocked else "Customer unblocked.",show_alert=True); await admin_customer_detail(update,context)
+async def admin_customer_remove_prompt(update,context):
+    q=update.callback_query
+    if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
+    uid=int(q.data.split(":",1)[1]); u=admin_get_user_by_db_id(uid)
+    if not u: await q.answer("Customer not found.",show_alert=True); return
+    await q.answer(); await q.edit_message_text("⚠️ REMOVE CUSTOMER\n\nThis permanently removes the customer only when there is no history. Are you sure?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes, Remove",callback_data=f"admin_customer_remove_confirm:{uid}")],[InlineKeyboardButton("❌ Cancel",callback_data=f"admin_customer:{uid}")]]))
+async def admin_customer_remove_confirm(update,context):
+    q=update.callback_query
+    if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
+    uid=int(q.data.split(":",1)[1])
+    try: admin_remove_user(uid,update.effective_user.id); await q.answer("Customer removed.",show_alert=True); await admin_customers(update,context)
+    except Exception as e: await q.answer(str(e)[:190],show_alert=True); await admin_customer_detail(update,context)
+async def admin_customer_search_prompt(update,context):
+    q=update.callback_query
+    if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
+    context.user_data["admin_customer_search"]=True; await q.answer(); await q.edit_message_text("🔍 SEARCH CUSTOMER\n\nSend Telegram ID, username, or name:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_customers")]]))
 
 # =========================
 # STAGE 5B — STOCK MANAGEMENT
@@ -1339,6 +1409,14 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_delete_product_prompt,pattern="^admin_delete:"))
     application.add_handler(CallbackQueryHandler(admin_delete_product_confirm,pattern="^admin_delete_confirm:"))
     application.add_handler(CallbackQueryHandler(admin_add_product_prompt,pattern="^admin_add_product$"))
+    application.add_handler(CallbackQueryHandler(admin_orders,pattern="^admin_orders$"))
+    application.add_handler(CallbackQueryHandler(admin_order_detail,pattern="^admin_order:"))
+    application.add_handler(CallbackQueryHandler(admin_customers,pattern="^admin_customers$"))
+    application.add_handler(CallbackQueryHandler(admin_customer_detail,pattern="^admin_customer:"))
+    application.add_handler(CallbackQueryHandler(admin_customer_block,pattern="^admin_customer_block:"))
+    application.add_handler(CallbackQueryHandler(admin_customer_remove_prompt,pattern="^admin_customer_remove:"))
+    application.add_handler(CallbackQueryHandler(admin_customer_remove_confirm,pattern="^admin_customer_remove_confirm:"))
+    application.add_handler(CallbackQueryHandler(admin_customer_search_prompt,pattern="^admin_customer_search$"))
     application.add_handler(CallbackQueryHandler(admin_stock_menu,pattern="^admin_stock_menu$"))
     application.add_handler(CallbackQueryHandler(admin_stock_overview,pattern="^admin_stock$"))
     application.add_handler(CallbackQueryHandler(admin_stock_add_menu,pattern="^admin_stock_add$"))
@@ -1390,6 +1468,9 @@ def main():
 
     # Text handler first checks active payment/amount states.
     async def text_router(update,context):
+        if context.user_data.get("admin_customer_search") and await admin_only(update):
+            raw=(update.message.text or "").strip(); context.user_data.pop("admin_customer_search",None); rows=admin_list_users(30,raw)
+            await update.message.reply_text(f"👥 CUSTOMERS\n━━━━━━━━━━━━━━━━\n\nSearch: {raw}\nTotal shown: {len(rows)}",reply_markup=admin_customers_kb(rows)); return
         if await admin_stock_field_input_handler(update,context): return
         if await admin_stock_input_handler(update,context): return
         if await admin_input_handler(update,context): return
@@ -1399,7 +1480,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_router))
     application.add_error_handler(error_handler)
 
-    print(f"{STORE_NAME} Stage 5B bot is running...")
+    print(f"{STORE_NAME} Stage 5C bot is running...")
     application.run_polling()
 
 if __name__ == "__main__": main()
