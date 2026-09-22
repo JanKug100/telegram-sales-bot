@@ -107,9 +107,54 @@ def _parse_communication_stock_row(content):
     return [raw]
 
 
+def _clean_stock_field_names(field_names):
+    """Return human-readable field names from sqlite3.Row objects or strings."""
+    names=[]
+    for item in (field_names or []):
+        if isinstance(item, dict):
+            value=item.get("field_name") or item.get("name") or ""
+        else:
+            try:
+                keys=item.keys()
+                if "field_name" in keys:
+                    value=item["field_name"]
+                else:
+                    value=str(item)
+            except Exception:
+                value=str(item)
+        value=str(value or "").strip()
+        if value:
+            names.append(value)
+    return names
+
+
+def _stock_field_example_value(field_name, index):
+    """Generate an example value based on the configured field name."""
+    name=str(field_name or "").strip().lower()
+    if "password" in name or "pass" in name:
+        return "password1"
+    if "2fa" in name or "otp" in name or "auth" in name:
+        return "2FA-CODE"
+    if "recovery" in name and "email" in name:
+        return "recovery@example.com"
+    if "email" in name or "mail" in name:
+        return "user1@example.com"
+    if "phone" in name or "number" in name or "mobile" in name:
+        return "+1234567890"
+    if "link" in name or "url" in name:
+        return "https://example.com/recovery"
+    if "name" in name:
+        return "Account Name"
+    if "username" in name or "user" in name:
+        return "username123"
+    if "code" in name:
+        return "CODE123"
+    return f"value{index + 1}"
+
+
 def build_csv_bytes(contents, field_names=None):
     rows = [_parse_communication_stock_row(x) for x in (contents or [])] or [[""]]
-    configured = [str(x).strip() for x in (field_names or []) if str(x).strip()]
+    configured = _clean_stock_field_names(field_names)
 
     # If the product has custom fields, use those exact names as CSV headers.
     # If a stock row contains more values than configured fields, preserve them
@@ -999,9 +1044,10 @@ async def admin_stock_add_product(update, context):
     p=admin_get_product(product_id)
     if not p: await q.answer("Product not found.",show_alert=True); return
     fields = admin_get_stock_fields(product_id)
-    field_text = "\n".join(f"{i}. {name}" for i, name in enumerate(fields, 1)) if fields else "No custom fields configured yet."
-    example_values = ["user1@example.com", "password1", "2FA-CODE", "+1234567890", "https://example.com/recovery"]
-    example = ",".join(example_values[:len(fields)]) if fields else "email,password,2FA,number,link"
+    field_names = _clean_stock_field_names(fields)
+    field_text = "\n".join(f"{i}. {name}" for i, name in enumerate(field_names, 1)) if field_names else "No custom fields configured yet."
+    example_values = [_stock_field_example_value(name, i) for i, name in enumerate(field_names)]
+    example = ",".join(example_values) if field_names else "email,password,2FA,number,link"
     context.user_data["admin_stock_input"]={"action":"add","product_id":product_id,"field_count":len(fields)}
     await q.answer()
     await q.edit_message_text(
@@ -1010,8 +1056,8 @@ async def admin_stock_add_product(update, context):
         "Send one stock item per line.\n"
         f"Use comma, TAB, or | between fields.\n"
         "The number/order of values must match the fields above.\n\n"
-        f"Example:\n{example}\n\n"
-        "Each line becomes one stock item.\n"
+        f"Example (same order as the fields above):\n{example}\n\n"
+        "📌 Copy this format when adding stock. Each line = 1 stock item.\n"
         "You can paste many lines at once.\n\n"
         "Need different fields? Use ⚙️ Stock Fields first.",
         reply_markup=InlineKeyboardMarkup([
