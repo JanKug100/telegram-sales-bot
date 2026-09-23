@@ -420,13 +420,36 @@ def confirm_payment(payment_id:int, admin_id:int):
             connection.commit(); return result
         if payment["status"]!="pending": raise ValueError(f"Payment status is {payment['status']}.")
         user=cursor.execute("SELECT id,balance FROM users WHERE id=?",(payment["user_id"],)).fetchone()
+
+        # For a purchase payment, verify that the wallet balance has not changed
+        # since the payment amount was calculated. This prevents approving a
+        # stale partial-payment amount after the user's balance changes.
+        intent_id=payment["purchase_intent_id"]
+        if intent_id:
+            intent_check=cursor.execute(
+                "SELECT total_amount,status FROM purchase_intents WHERE id=? AND user_id=?",
+                (intent_id,user["id"])
+            ).fetchone()
+            if not intent_check:
+                raise ValueError("Purchase intent not found.")
+            if intent_check["status"]=="pending_payment":
+                current_balance=round(float(user["balance"]),2)
+                total_amount=round(float(intent_check["total_amount"]),2)
+                expected_payment=max(0.0,round(total_amount-current_balance,2))
+                submitted_payment=round(float(payment["amount"]),2)
+                if abs(submitted_payment-expected_payment)>0.001:
+                    raise ValueError(
+                        f"Wallet balance changed. Expected payment ${expected_payment:.2f}, "
+                        f"but this payment is ${submitted_payment:.2f}. Please create a new payment."
+                    )
+
         before=float(user["balance"]); amount=float(payment["amount"]); after=round(before+amount,8)
         cursor.execute("UPDATE users SET balance=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(after,user["id"]))
         cursor.execute("""INSERT INTO balance_transactions(user_id,transaction_type,amount,balance_before,balance_after,reference,description)
                           VALUES(?,?,?,?,?,?,?)""",(user["id"],"payment",amount,before,after,f"payment:{payment_id}",f"Payment #{payment_id} confirmed"))
         referral_commission=_apply_referral_commission_locked(cursor,payment_id,user["id"],amount)
         cursor.execute("UPDATE payments SET status='paid',approved_at=CURRENT_TIMESTAMP,confirmed_at=CURRENT_TIMESTAMP,confirmed_by=? WHERE id=?",(admin_id,payment_id))
-        intent_id=payment["purchase_intent_id"]; purchase=None
+        purchase=None
         if intent_id:
             cursor.execute("UPDATE purchase_intents SET status='ready',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending_payment'",(intent_id,))
             purchase=_complete_purchase_locked(cursor,intent_id,payment_id,admin_id)
