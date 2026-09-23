@@ -698,6 +698,39 @@ def admin_remove_user(user_id: int, admin_telegram_id: int):
     finally: con.close()
 
 # =========================
+# STAGE 5E — BROADCAST HELPERS
+# =========================
+
+def admin_broadcast_recipients(user_ids=None):
+    """Return active customers eligible to receive an admin broadcast.
+
+    Blocked customers are excluded. When user_ids is supplied, only those
+    database user IDs are returned, while still excluding blocked accounts.
+    """
+    con=get_connection(); cur=con.cursor()
+    try:
+        if user_ids is not None:
+            ids=[]
+            for value in user_ids:
+                try:
+                    ids.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+            if not ids:
+                return []
+            placeholders=','.join('?' for _ in ids)
+            return cur.execute(
+                f"SELECT id,telegram_id,username,first_name,last_name FROM users "
+                f"WHERE is_blocked=0 AND id IN ({placeholders}) ORDER BY id DESC", ids
+            ).fetchall()
+        return cur.execute(
+            "SELECT id,telegram_id,username,first_name,last_name FROM users "
+            "WHERE is_blocked=0 ORDER BY id DESC"
+        ).fetchall()
+    finally:
+        con.close()
+
+# =========================
 # STAGE 5B STOCK HELPERS
 # =========================
 
