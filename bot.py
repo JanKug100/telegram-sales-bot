@@ -860,7 +860,7 @@ async def admin_payment_accept_callback(update, context):
 
 
 async def admin_payment_cancel_callback(update, context):
-    """First-stage cancel: show a recheck screen; do not cancel yet."""
+    """Cancel a pending payment directly. Recheck is available separately from the admin panel."""
     q = update.callback_query
     if not await admin_only(update):
         await q.answer("Admin access required.", show_alert=True)
@@ -877,19 +877,26 @@ async def admin_payment_cancel_callback(update, context):
     if payment["status"] != "pending":
         await q.answer(f"Payment is already {payment['status']}.", show_alert=True)
         return
-    await q.answer()
-    await q.edit_message_text(
-        f"⚠️ CANCEL PAYMENT RECHECK\n━━━━━━━━━━━━━━━━\n\n"
-        f"Payment #{payment_id}\n"
-        f"User: {payment['telegram_id']}\n"
-        f"Amount: ${float(payment['amount']):.2f}\n"
-        f"Transaction ID: {payment['transaction_id'] or 'Not submitted'}\n\n"
-        "Please re-check the payment before\nfinal cancellation.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ CONFIRM CANCEL", callback_data=f"admin_payment_cancel_confirm:{payment_id}")],
-            [InlineKeyboardButton("✅ ACCEPT PAYMENT", callback_data=f"admin_payment_accept:{payment_id}")],
-        ])
-    )
+    try:
+        cancel_payment(payment_id, update.effective_user.id, "Cancelled by admin")
+        await q.answer("Payment cancelled.")
+        await q.edit_message_text(
+            f"❌ PAYMENT CANCELLED\n━━━━━━━━━━━━━━━━\n\n"
+            f"Payment #{payment_id}\n"
+            f"User: {payment['telegram_id']}\n"
+            f"Transaction ID: {payment['transaction_id'] or 'Not submitted'}\n\n"
+            "The payment was cancelled by admin.\n\n"
+            "If needed, you can recheck this payment from the Admin Panel."
+        )
+        await context.bot.send_message(
+            payment["telegram_id"],
+            f"❌ PAYMENT CANCELLED\n━━━━━━━━━━━━━━━━\n\n"
+            f"Payment #{payment_id} has been cancelled by admin.\n"
+            "No balance was credited and the pending purchase was cancelled.",
+            reply_markup=main_menu_keyboard(),
+        )
+    except Exception as e:
+        await q.answer(f"Could not cancel: {e}", show_alert=True)
 
 
 async def admin_payment_cancel_confirm_callback(update, context):
@@ -2267,7 +2274,6 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_payment_toggle,pattern="^admin_payment_toggle:"))
     application.add_handler(CallbackQueryHandler(admin_payment_accept_callback,pattern="^admin_payment_accept:"))
     application.add_handler(CallbackQueryHandler(admin_payment_cancel_callback,pattern="^admin_payment_cancel:"))
-    application.add_handler(CallbackQueryHandler(admin_payment_cancel_confirm_callback,pattern="^admin_payment_cancel_confirm:"))
     application.add_handler(CallbackQueryHandler(admin_cancelled_payments_7d,pattern="^admin_cancelled_payments_7d$"))
     application.add_handler(CallbackQueryHandler(admin_cancelled_payment_recheck,pattern="^admin_cancelled_recheck:"))
     application.add_handler(CallbackQueryHandler(admin_cancelled_payment_accept,pattern="^admin_cancelled_accept:"))
