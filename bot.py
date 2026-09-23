@@ -16,6 +16,7 @@ from db import (
     get_product_by_key, get_available_stock_count, create_purchase_intent,
     complete_purchase, create_payment, get_payment, submit_payment_reference,
     confirm_payment, cancel_payment, get_recent_orders, get_order_items,
+    get_cancelled_payments_7d, reaccept_cancelled_payment,
     admin_dashboard_stats, admin_list_products, admin_get_product,
     admin_create_product, admin_update_product, admin_delete_product,
     admin_list_categories, admin_log, admin_create_communication_app,
@@ -859,6 +860,7 @@ async def admin_payment_accept_callback(update, context):
 
 
 async def admin_payment_cancel_callback(update, context):
+    """First-stage cancel: show a recheck screen; do not cancel yet."""
     q = update.callback_query
     if not await admin_only(update):
         await q.answer("Admin access required.", show_alert=True)
@@ -868,7 +870,6 @@ async def admin_payment_cancel_callback(update, context):
     except Exception:
         await q.answer("Invalid payment.", show_alert=True)
         return
-
     payment = get_payment(payment_id)
     if not payment:
         await q.answer("Payment not found.", show_alert=True)
@@ -876,16 +877,43 @@ async def admin_payment_cancel_callback(update, context):
     if payment["status"] != "pending":
         await q.answer(f"Payment is already {payment['status']}.", show_alert=True)
         return
+    await q.answer()
+    await q.edit_message_text(
+        f"⚠️ CANCEL PAYMENT RECHECK\n━━━━━━━━━━━━━━━━\n\n"
+        f"Payment #{payment_id}\n"
+        f"User: {payment['telegram_id']}\n"
+        f"Amount: ${float(payment['amount']):.2f}\n"
+        f"Transaction ID: {payment['transaction_id'] or 'Not submitted'}\n\n"
+        "Please re-check the payment before\nfinal cancellation.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ CONFIRM CANCEL", callback_data=f"admin_payment_cancel_confirm:{payment_id}")],
+            [InlineKeyboardButton("✅ ACCEPT PAYMENT", callback_data=f"admin_payment_accept:{payment_id}")],
+        ])
+    )
 
+
+async def admin_payment_cancel_confirm_callback(update, context):
+    """Final cancellation after the admin has rechecked the payment."""
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True); return
     try:
-        cancel_payment(payment_id, update.effective_user.id, "Cancelled by admin")
+        payment_id=int(q.data.split(":",1)[1])
+    except Exception:
+        await q.answer("Invalid payment.", show_alert=True); return
+    payment=get_payment(payment_id)
+    if not payment:
+        await q.answer("Payment not found.", show_alert=True); return
+    if payment["status"]!="pending":
+        await q.answer(f"Payment is already {payment['status']}.", show_alert=True); return
+    try:
+        cancel_payment(payment_id,update.effective_user.id,"Cancelled by admin after recheck")
         await q.answer("Payment cancelled.")
         await q.edit_message_text(
             f"❌ PAYMENT CANCELLED\n━━━━━━━━━━━━━━━━\n\n"
-            f"Payment #{payment_id}\n"
-            f"User: {payment['telegram_id']}\n"
+            f"Payment #{payment_id}\nUser: {payment['telegram_id']}\n"
             f"Transaction ID: {payment['transaction_id'] or 'Not submitted'}\n\n"
-            "The payment was cancelled by admin."
+            "The payment was cancelled by admin after recheck."
         )
         await context.bot.send_message(
             payment["telegram_id"],
@@ -895,7 +923,116 @@ async def admin_payment_cancel_callback(update, context):
             reply_markup=main_menu_keyboard(),
         )
     except Exception as e:
-        await q.answer(f"Could not cancel: {e}", show_alert=True)
+        await q.answer(f"Could not cancel: {e}",show_alert=True)
+
+
+async def admin_cancelled_payments_7d(update, context):
+    """Admin history: cancelled payments from the last 7 days only."""
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.",show_alert=True); return
+    rows=get_cancelled_payments_7d(50)
+    await q.answer()
+    if not rows:
+        await q.edit_message_text(
+            "⚠️ CANCEL PAYMENT RECHECK\n━━━━━━━━━━━━━━━━\n\n"
+            "📋 LAST 7 DAYS CANCELLED PAYMENTS\n\n"
+            "No cancelled payments found in the last 7 days.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin Panel",callback_data="admin_panel")]])
+        )
+        return
+    lines=["⚠️ CANCEL PAYMENT RECHECK","━━━━━━━━━━━━━━━━","","📋 LAST 7 DAYS CANCELLED PAYMENTS","━━━━━━━━━━━━━━━━"]
+    buttons=[]
+    for p in rows:
+        cancelled_at=p["confirmed_at"] or p["created_at"]
+        lines.append(f"\n#{p['id']} | ${float(p['amount']):.2f}\nUser: {p['telegram_id']}\nTX: {p['transaction_id'] or 'Not submitted'}\nCancelled: {cancelled_at}")
+        buttons.append([InlineKeyboardButton(f"🔎 Recheck #{p['id']}",callback_data=f"admin_cancelled_recheck:{p['id']}")])
+    buttons.append([InlineKeyboardButton("🔙 Admin Panel",callback_data="admin_panel")])
+    await q.edit_message_text("\n".join(lines),reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def admin_cancelled_payment_recheck(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.",show_alert=True); return
+    try:
+        payment_id=int(q.data.split(":",1)[1])
+    except Exception:
+        await q.answer("Invalid payment.",show_alert=True); return
+    payment=get_payment(payment_id)
+    if not payment:
+        await q.answer("Payment not found.",show_alert=True); return
+    if payment["status"]!="cancelled":
+        await q.answer(f"Payment is already {payment['status']}.",show_alert=True); return
+    await q.answer()
+    await q.edit_message_text(
+        f"⚠️ PAYMENT RECHECK\n━━━━━━━━━━━━━━━━\n\n"
+        f"Payment #{payment_id}\nUser: {payment['telegram_id']}\n"
+        f"Amount: ${float(payment['amount']):.2f}\n"
+        f"Transaction ID: {payment['transaction_id'] or 'Not submitted'}\n"
+        f"Cancelled: {payment['confirmed_at'] or payment['created_at']}\n\n"
+        "This payment was cancelled within the last 7 days.\n"
+        "Re-check the transaction before accepting it again.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ ACCEPT PAYMENT",callback_data=f"admin_cancelled_accept:{payment_id}")],
+            [InlineKeyboardButton("🔙 Cancelled Payments",callback_data="admin_cancelled_payments_7d")],
+        ])
+    )
+
+
+async def admin_cancelled_payment_accept(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.",show_alert=True); return
+    try:
+        payment_id=int(q.data.split(":",1)[1])
+    except Exception:
+        await q.answer("Invalid payment.",show_alert=True); return
+    payment=get_payment(payment_id)
+    if not payment:
+        await q.answer("Payment not found.",show_alert=True); return
+    if payment["status"]!="cancelled":
+        await q.answer(f"Payment is already {payment['status']}.",show_alert=True); return
+    if not payment["transaction_id"]:
+        await q.answer("This payment has no transaction/order ID.",show_alert=True); return
+    try:
+        result=reaccept_cancelled_payment(payment_id,update.effective_user.id)
+        purchase=result.get("purchase")
+        commission=float(result.get("referral_commission",0) or 0)
+        await q.answer("Payment accepted again.")
+        if purchase and not purchase.get("already_completed"):
+            await q.edit_message_text(
+                f"✅ PAYMENT RE-ACCEPTED\n━━━━━━━━━━━━━━━━\n\n"
+                f"Payment #{payment_id}\nUser: {payment['telegram_id']}\n"
+                f"Transaction ID: {payment['transaction_id']}\n\n"
+                f"Order #{purchase['order_id']} completed and delivered."
+                + (f"\nReferral commission: ${commission:.2f}" if commission>0 else "")
+            )
+            await context.bot.send_message(
+                purchase["telegram_id"],
+                f"✅ PAYMENT CONFIRMED\n━━━━━━━━━━━━━━━━\n\n"
+                f"Payment #{payment_id} was re-accepted after admin recheck.\n"
+                f"Order #{purchase['order_id']} completed.\n\n📦 Delivery is being sent...",
+                reply_markup=back_main_keyboard(),
+            )
+            await send_purchase_delivery(context.bot,purchase)
+        else:
+            await q.edit_message_text(
+                f"✅ PAYMENT RE-ACCEPTED\n━━━━━━━━━━━━━━━━\n\n"
+                f"Payment #{payment_id}\nUser: {payment['telegram_id']}\n"
+                f"Transaction ID: {payment['transaction_id']}\n\n"
+                "Balance has been credited once."
+                + (f"\nReferral commission: ${commission:.2f}" if commission>0 else "")
+            )
+            await context.bot.send_message(
+                payment["telegram_id"],
+                f"✅ PAYMENT CONFIRMED\n━━━━━━━━━━━━━━━━\n\n"
+                f"Payment #{payment_id} was re-accepted after admin recheck.\n"
+                "Your balance has been credited successfully.",
+                reply_markup=main_menu_keyboard(),
+            )
+    except Exception as e:
+        await q.answer(f"Could not accept: {e}",show_alert=True)
 
 
 # =========================
@@ -913,6 +1050,7 @@ def admin_kb():
         [InlineKeyboardButton("👥 Referrals", callback_data="admin_referrals")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings")],
         [InlineKeyboardButton("💳 Payment Methods", callback_data="admin_payment_methods")],
+        [InlineKeyboardButton("⚠️ CANCEL PAYMENT RECHECK", callback_data="admin_cancelled_payments_7d")],
         [InlineKeyboardButton("📢 Broadcast / Notice", callback_data="admin_broadcast")],
         [InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")],
     ])
@@ -2129,6 +2267,10 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_payment_toggle,pattern="^admin_payment_toggle:"))
     application.add_handler(CallbackQueryHandler(admin_payment_accept_callback,pattern="^admin_payment_accept:"))
     application.add_handler(CallbackQueryHandler(admin_payment_cancel_callback,pattern="^admin_payment_cancel:"))
+    application.add_handler(CallbackQueryHandler(admin_payment_cancel_confirm_callback,pattern="^admin_payment_cancel_confirm:"))
+    application.add_handler(CallbackQueryHandler(admin_cancelled_payments_7d,pattern="^admin_cancelled_payments_7d$"))
+    application.add_handler(CallbackQueryHandler(admin_cancelled_payment_recheck,pattern="^admin_cancelled_recheck:"))
+    application.add_handler(CallbackQueryHandler(admin_cancelled_payment_accept,pattern="^admin_cancelled_accept:"))
     application.add_handler(CallbackQueryHandler(admin_dashboard,pattern="^admin_dashboard$"))
     application.add_handler(CallbackQueryHandler(admin_products_callback,pattern="^admin_products$"))
     application.add_handler(CallbackQueryHandler(admin_products_page,pattern="^admin_products_page:"))
