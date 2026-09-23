@@ -18,7 +18,8 @@ from db import (
     confirm_payment, cancel_payment, get_recent_orders, get_order_items,
     admin_dashboard_stats, admin_list_products, admin_get_product,
     admin_create_product, admin_update_product, admin_delete_product,
-    admin_list_categories, admin_log,
+    admin_list_categories, admin_log, admin_create_communication_app,
+    get_communication_products, get_communication_children,
     admin_stock_summary, admin_stock_items, admin_add_stock, admin_remove_stock,
     admin_recent_orders, admin_get_order, admin_order_items, admin_list_users, admin_get_user_by_db_id,
     admin_set_user_blocked, admin_remove_user,
@@ -70,6 +71,8 @@ def product_key_from_callback(data: str) -> str:
 def product_purchase_keyboard(product_key: str, stock_count: int):
     # Preset quantities are convenient, while Custom Quantity lets the
     # customer enter any positive whole number up to the available stock.
+    product=get_product_by_key(product_key)
+    back="communication_apps" if product and str(product["category_name"] or "").lower()=="communication apps" else "buy_vpn"
     rows = [
         [InlineKeyboardButton("1", callback_data=f"buyqty:{product_key}:1"),
          InlineKeyboardButton("2", callback_data=f"buyqty:{product_key}:2"),
@@ -77,7 +80,7 @@ def product_purchase_keyboard(product_key: str, stock_count: int):
         [InlineKeyboardButton("5", callback_data=f"buyqty:{product_key}:5"),
          InlineKeyboardButton("10", callback_data=f"buyqty:{product_key}:10")],
         [InlineKeyboardButton("✏️ Custom Quantity", callback_data=f"customqty:{product_key}")],
-        [InlineKeyboardButton("🔙 Back", callback_data="communication_apps" if product_key in {"gv_old","gv_new","tn_web","tn_phone","tf_web","tf_phone","sl_web","sl_phone","talkatone","textplus"} else "buy_vpn")],
+        [InlineKeyboardButton("🔙 Back", callback_data=back)],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -260,8 +263,42 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def communication_apps(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
-    kb=[[InlineKeyboardButton("Google Voice",callback_data="google_voice"),InlineKeyboardButton("TextNow",callback_data="textnow")],[InlineKeyboardButton("TextFree",callback_data="textfree"),InlineKeyboardButton("Sideline",callback_data="sideline")],[InlineKeyboardButton("Talkatone",callback_data="talkatone"),InlineKeyboardButton("TextPlus",callback_data="textplus")],[InlineKeyboardButton("🏠 Main Menu",callback_data="main_menu")]]
-    await q.edit_message_text("💬 COMMUNICATION APPS\n━━━━━━━━━━━━━━━━\n\nSelect a product:",reply_markup=InlineKeyboardMarkup(kb))
+    products=get_communication_products()
+    kb=[]
+    for i in range(0,len(products),2):
+        row=[]
+        for p in products[i:i+2]:
+            if str(p["product_type"]).lower()=="group":
+                label=f"{p['name']}"
+                callback=f"comm_group:{p['id']}"
+            else:
+                label=f"{p['name']} — ${float(p['price']):.2f}"
+                callback=f"product_{p['product_key']}"
+            row.append(InlineKeyboardButton(label,callback_data=callback))
+        kb.append(row)
+    kb.append([InlineKeyboardButton("🏠 Main Menu",callback_data="main_menu")])
+    await q.edit_message_text("💬 COMMUNICATION APPS\n━━━━━━━━━━━━━━━━\n\nSelect an app:",reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def communication_group(update, context):
+    q=update.callback_query
+    if not q.data.startswith("comm_group:"): return
+    parent_id=int(q.data.split(":",1)[1])
+    parent=admin_get_product(parent_id)
+    if not parent or str(parent["product_type"]).lower()!="group":
+        await q.answer("App not found.",show_alert=True); return
+    children=get_communication_children(parent_id)
+    if not children:
+        await q.answer("No subcategories available.",show_alert=True); return
+    await q.answer()
+    kb=[]
+    for i in range(0,len(children),2):
+        row=[]
+        for p in children[i:i+2]:
+            row.append(InlineKeyboardButton(f"{p['name']} — ${float(p['price']):.2f}",callback_data=f"product_{p['product_key']}"))
+        kb.append(row)
+    kb.append([InlineKeyboardButton("🔙 Communication Apps",callback_data="communication_apps")])
+    await q.edit_message_text(f"📱 {parent['name'].upper()}\n━━━━━━━━━━━━━━━━\n\nChoose product:",reply_markup=InlineKeyboardMarkup(kb))
 
 
 def simple_two_product_screen(title, products, back="communication_apps"):
@@ -1041,22 +1078,96 @@ async def admin_add_product_prompt(update, context):
     if not await admin_only(update):
         await q.answer("Admin access required.", show_alert=True)
         return
-    cats = admin_list_categories()
-    cat_lines = "\n".join([f"{c['id']} = {c['name']}" for c in cats])
-    context.user_data["admin_input"] = {"kind": "add_product"}
     await q.answer()
+    cats=admin_list_categories()
+    rows=[]
+    for c in cats:
+        rows.append([InlineKeyboardButton(f"{c['emoji'] or ''} {c['name']}",callback_data=f"admin_add_category:{c['id']}")])
+    rows.append([InlineKeyboardButton("❌ Cancel",callback_data="admin_products")])
+    context.user_data.pop("admin_input",None)
+    context.user_data.pop("comm_wizard",None)
+    await q.edit_message_text("➕ ADD PRODUCT\n━━━━━━━━━━━━━━━━\n\nSelect a category:",reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def admin_add_category(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.",show_alert=True); return
+    category_id=int(q.data.split(":",1)[1])
+    cats=admin_list_categories(); cat=next((c for c in cats if int(c["id"])==category_id),None)
+    if not cat:
+        await q.answer("Category not found.",show_alert=True); return
+    await q.answer()
+    if str(cat["name"]).lower()=="communication apps":
+        context.user_data["comm_wizard"]={"category_id":category_id,"step":"app_name","subcategories":[]}
+        context.user_data.pop("admin_input",None)
+        await q.edit_message_text("➕ ADD COMMUNICATION APP\n━━━━━━━━━━━━━━━━\n\nSend the App Name.\n\nExample: Google Voice",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_comm_cancel")]]))
+        return
+    # Keep the existing simple one-message creator for categories not being redesigned yet.
+    context.user_data["admin_input"]={"kind":"add_product","category_id":category_id}
     await q.edit_message_text(
         "➕ ADD PRODUCT\n━━━━━━━━━━━━━━━━\n\n"
-        "Send the product details in ONE message using:\n\n"
-        "category_id | product_key | product_name | price\n\n"
-        "Example:\n"
-        "1 | gv_new2 | Google Voice New 2 | 3.50\n\n"
-        "Available categories:\n" + cat_lines +
-        "\n\nProduct will be created as Active.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data="admin_products")]
-        ])
+        "Send: product_key | product_name | price\n\n"
+        "Example: new_vpn | New VPN | 2.00",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_products")]])
     )
+
+
+async def admin_comm_sub_choice(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.",show_alert=True); return
+    state=context.user_data.get("comm_wizard")
+    if not state:
+        await q.answer("Wizard expired. Start again.",show_alert=True); return
+    yes=q.data=="admin_comm_sub_yes"
+    await q.answer()
+    if not yes:
+        state["step"]="direct_price"
+        await q.edit_message_text(f"📱 {state['app_name']}\n━━━━━━━━━━━━━━━━\n\nNo Sub Categories selected.\n\nSend the USD price.\nExample: 2.00",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_comm_cancel")]]))
+        return
+    state["step"]="sub_name"
+    await q.edit_message_text("➕ ADD SUB CATEGORY\n━━━━━━━━━━━━━━━━\n\nSend the Sub Category Name.\n\nExample: Old GV",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_comm_cancel")]]))
+
+
+async def admin_comm_cancel(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.",show_alert=True); return
+    context.user_data.pop("comm_wizard",None); context.user_data.pop("admin_input",None)
+    await q.answer("Cancelled.")
+    await admin_products(update,context)
+
+
+async def admin_comm_add_more(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.",show_alert=True); return
+    state=context.user_data.get("comm_wizard")
+    if not state:
+        await q.answer("Wizard expired.",show_alert=True); return
+    state["step"]="sub_name"
+    await q.answer()
+    await q.edit_message_text("➕ ADD SUB CATEGORY\n━━━━━━━━━━━━━━━━\n\nSend the next Sub Category Name.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_comm_cancel")]]))
+
+
+async def admin_comm_done(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.",show_alert=True); return
+    state=context.user_data.get("comm_wizard")
+    if not state or not state.get("subcategories"):
+        await q.answer("Add at least one subcategory first.",show_alert=True); return
+    try:
+        result=admin_create_communication_app(state["category_id"],state["app_name"],state["subcategories"])
+        admin_log(update.effective_user.id,"add_communication_app_group","product",result["parent_id"],state["app_name"])
+        lines=[f"• {x['name']} — ${x['price']:.2f}" for x in state["subcategories"]]
+        context.user_data.pop("comm_wizard",None)
+        await q.answer("Created.")
+        await q.edit_message_text(f"✅ Communication App created\n━━━━━━━━━━━━━━━━\n\n📱 {state['app_name']}\n\n"+"\n".join(lines)+"\n\nYou can now add stock to each subcategory.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛍️ Products",callback_data="admin_products")],[InlineKeyboardButton("🔐 Admin Panel",callback_data="admin_panel")]]))
+    except Exception as e:
+        await q.answer("Could not create app.",show_alert=True)
+        await q.edit_message_text(f"❌ {e}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Add Product",callback_data="admin_add_product")]]))
 
 
 async def admin_input_handler(update, context) -> bool:
@@ -1069,6 +1180,44 @@ async def admin_input_handler(update, context) -> bool:
 
     raw = update.message.text.strip()
     kind = state.get("kind")
+
+    # Communication Apps uses its own step-by-step wizard.
+    comm=context.user_data.get("comm_wizard")
+    if comm:
+        try:
+            step=comm.get("step")
+            if step=="app_name":
+                if not raw or len(raw)>100: raise ValueError("App name must be 1-100 characters.")
+                comm["app_name"]=raw
+                comm["step"]="sub_choice"
+                await update.message.reply_text("📱 APP NAME: " + raw + "\n\nDoes this app have Sub Categories?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes",callback_data="admin_comm_sub_yes"),InlineKeyboardButton("❌ No",callback_data="admin_comm_sub_no")],[InlineKeyboardButton("❌ Cancel",callback_data="admin_comm_cancel")]]))
+                return True
+            if step=="direct_price":
+                price=float(raw)
+                if price<0: raise ValueError("Price cannot be negative.")
+                result=admin_create_communication_app(comm["category_id"],comm["app_name"],[],direct_price=price)
+                admin_log(update.effective_user.id,"add_communication_app","product",result["product_id"],f"{comm['app_name']} / ${price:.2f}")
+                name=comm["app_name"]
+                context.user_data.pop("comm_wizard",None)
+                await update.message.reply_text(f"✅ Communication App added.\n\n📱 {name} — ${price:.2f}\n\nIt has no Sub Categories.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛍️ Products",callback_data="admin_products")],[InlineKeyboardButton("🔐 Admin Panel",callback_data="admin_panel")]]))
+                return True
+            if step=="sub_name":
+                if not raw or len(raw)>100: raise ValueError("Sub Category name must be 1-100 characters.")
+                comm["pending_sub_name"]=raw
+                comm["step"]="sub_price"
+                await update.message.reply_text(f"💵 Price for {raw}\n\nSend USD price.\nExample: 5.00",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_comm_cancel")]]))
+                return True
+            if step=="sub_price":
+                price=float(raw)
+                if price<0: raise ValueError("Price cannot be negative.")
+                comm.setdefault("subcategories",[]).append({"name":comm.pop("pending_sub_name"),"price":round(price,2)})
+                comm["step"]="waiting_more"
+                lines=[f"• {x['name']} — ${x['price']:.2f}" for x in comm["subcategories"]]
+                await update.message.reply_text("📱 " + comm["app_name"] + "\n━━━━━━━━━━━━━━━━\n\n"+"\n".join(lines)+"\n\nAdd another Sub Category?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add Another",callback_data="admin_comm_add_more"),InlineKeyboardButton("✅ Done",callback_data="admin_comm_done")],[InlineKeyboardButton("❌ Cancel",callback_data="admin_comm_cancel")]]))
+                return True
+        except ValueError as e:
+            await update.message.reply_text(f"❌ {e}\n\nPlease try again.")
+            return True
 
     try:
         if kind == "price":
@@ -1106,12 +1255,20 @@ async def admin_input_handler(update, context) -> bool:
 
         if kind == "add_product":
             parts = [x.strip() for x in raw.split("|")]
-            if len(parts) != 4:
-                raise ValueError("Use exactly: category_id | product_key | product_name | price")
-            category_id = int(parts[0])
-            key = parts[1]
-            name = parts[2]
-            price = float(parts[3])
+            if "category_id" in state:
+                if len(parts) != 3:
+                    raise ValueError("Use exactly: product_key | product_name | price")
+                category_id = int(state["category_id"])
+                key = parts[0]
+                name = parts[1]
+                price = float(parts[2])
+            else:
+                if len(parts) != 4:
+                    raise ValueError("Use exactly: category_id | product_key | product_name | price")
+                category_id = int(parts[0])
+                key = parts[1]
+                name = parts[2]
+                price = float(parts[3])
             if not key or not name or price < 0:
                 raise ValueError("Invalid product data.")
             product_id = admin_create_product(category_id, key, name, price)
@@ -1922,6 +2079,11 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_delete_product_prompt,pattern="^admin_delete:"))
     application.add_handler(CallbackQueryHandler(admin_delete_product_confirm,pattern="^admin_delete_confirm:"))
     application.add_handler(CallbackQueryHandler(admin_add_product_prompt,pattern="^admin_add_product$"))
+    application.add_handler(CallbackQueryHandler(admin_add_category,pattern="^admin_add_category:"))
+    application.add_handler(CallbackQueryHandler(admin_comm_sub_choice,pattern="^admin_comm_sub_yes$|^admin_comm_sub_no$"))
+    application.add_handler(CallbackQueryHandler(admin_comm_add_more,pattern="^admin_comm_add_more$"))
+    application.add_handler(CallbackQueryHandler(admin_comm_done,pattern="^admin_comm_done$"))
+    application.add_handler(CallbackQueryHandler(admin_comm_cancel,pattern="^admin_comm_cancel$"))
     application.add_handler(CallbackQueryHandler(admin_orders,pattern="^admin_orders$"))
     application.add_handler(CallbackQueryHandler(admin_order_detail,pattern="^admin_order:"))
     application.add_handler(CallbackQueryHandler(admin_customers,pattern="^admin_customers$"))
@@ -1961,6 +2123,7 @@ def main():
     application.add_handler(CallbackQueryHandler(pay_purchase,pattern="^paypurchase:"))
     application.add_handler(CallbackQueryHandler(enter_payment,pattern="^enterpay:"))
     application.add_handler(CallbackQueryHandler(cancel_user_payment,pattern="^cancel_user_payment:"))
+    application.add_handler(CallbackQueryHandler(communication_group,pattern="^comm_group:"))
     application.add_handler(CallbackQueryHandler(communication_product,pattern="^product_"))
     application.add_handler(CallbackQueryHandler(buy_vpn,pattern="^buy_vpn$"))
     application.add_handler(CallbackQueryHandler(vpn_03_days,pattern="^vpn_03_days$"))
