@@ -107,6 +107,7 @@ def init_db():
         _add_column_if_missing(cursor, "payments", "confirmed_at TIMESTAMP", "confirmed_at")
         _add_column_if_missing(cursor, "orders", "payment_id INTEGER", "payment_id")
         _add_column_if_missing(cursor, "orders", "purchase_intent_id INTEGER", "purchase_intent_id")
+        _add_column_if_missing(cursor, "products", "parent_product_id INTEGER", "parent_product_id")
 
         default_settings = {
             "store_name": "JanKug Store", "support_username": "@JanKug",
@@ -587,6 +588,67 @@ def admin_log(admin_telegram_id:int, action:str, target_type:Optional[str]=None,
         con.commit()
     finally: con.close()
 
+
+def admin_create_communication_group(category_id:int, product_key:str, name:str, variants, description=None):
+    con=get_connection(); cur=con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cat=cur.execute("SELECT id,name FROM categories WHERE id=? AND is_active=1",(category_id,)).fetchone()
+        if not cat or str(cat["name"]).lower()!="communication apps": raise ValueError("Communication Apps category not found or inactive.")
+        if cur.execute("SELECT id FROM products WHERE product_key=?",(product_key,)).fetchone(): raise ValueError("Product key already exists.")
+        if not variants: raise ValueError("At least one sub-category is required.")
+        cur.execute("""INSERT INTO products(category_id,product_key,name,description,price,product_type,validity_days,is_active) VALUES(?,?,?,?,?,?,?,1)""",(category_id,product_key,name,description,0.0,"group",None))
+        parent_id=cur.lastrowid
+        for order,(sub_name,price,variant_key) in enumerate(variants,1):
+            if cur.execute("SELECT id FROM products WHERE product_key=?",(variant_key,)).fetchone(): raise ValueError(f"Product key already exists: {variant_key}")
+            cur.execute("""INSERT INTO products(category_id,product_key,name,description,price,product_type,validity_days,is_active,parent_product_id,sort_order) VALUES(?,?,?,?,?,?,?,?,?,?)""",(category_id,variant_key,sub_name,description,float(price),"stock",None,1,parent_id,order))
+            pid=cur.lastrowid
+            for fo,fn in enumerate(("Email / Username","Password"),1): cur.execute("INSERT OR IGNORE INTO product_stock_fields(product_id,field_name,sort_order) VALUES(?,?,?)",(pid,fn,fo))
+        con.commit(); return parent_id
+    except Exception:
+        con.rollback(); raise
+    finally: con.close()
+
+def admin_create_vpn_packages(category_id:int, vpn_name:str, packages):
+    con=get_connection(); cur=con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cat=cur.execute("SELECT id,name FROM categories WHERE id=? AND is_active=1",(category_id,)).fetchone()
+        if not cat or str(cat["name"]).lower()!="vpn & proxy": raise ValueError("VPN & Proxy category not found or inactive.")
+        if not packages: raise ValueError("At least one validity is required.")
+        ids=[]
+        for days,price,key in packages:
+            days=int(days)
+            if days<1: raise ValueError("Validity must be at least 1 day.")
+            if cur.execute("SELECT id FROM products WHERE product_key=?",(key,)).fetchone(): raise ValueError(f"Product key already exists: {key}")
+            label=f"{int(days):02d} Days" if days<100 else f"{days} Days"
+            name=f"{vpn_name} VPN — {label}"
+            cur.execute("""INSERT INTO products(category_id,product_key,name,price,product_type,validity_days,is_active) VALUES(?,?,?,?,?,?,1)""",(category_id,key,name,float(price),"stock",days))
+            ids.append(cur.lastrowid)
+        con.commit(); return ids
+    except Exception:
+        con.rollback(); raise
+    finally: con.close()
+
+def get_communication_products():
+    con=get_connection(); cur=con.cursor()
+    try: return cur.execute("""SELECT p.*,c.name AS category_name,(SELECT COUNT(*) FROM stock s WHERE s.product_id=p.id AND s.status='available') AS available_stock FROM products p JOIN categories c ON c.id=p.category_id WHERE c.name='Communication Apps' AND p.is_active=1 AND p.parent_product_id IS NULL ORDER BY p.sort_order,p.id""").fetchall()
+    finally: con.close()
+
+def get_product_children(parent_product_id:int):
+    con=get_connection(); cur=con.cursor()
+    try: return cur.execute("""SELECT p.*,(SELECT COUNT(*) FROM stock s WHERE s.product_id=p.id AND s.status='available') AS available_stock FROM products p WHERE p.parent_product_id=? AND p.is_active=1 ORDER BY p.sort_order,p.id""",(parent_product_id,)).fetchall()
+    finally: con.close()
+
+def get_vpn_validities():
+    con=get_connection(); cur=con.cursor()
+    try: return [int(r["validity_days"]) for r in cur.execute("""SELECT DISTINCT p.validity_days FROM products p JOIN categories c ON c.id=p.category_id WHERE c.name='VPN & Proxy' AND p.is_active=1 AND p.validity_days IS NOT NULL ORDER BY p.validity_days""").fetchall()]
+    finally: con.close()
+
+def get_vpn_products_by_validity(days:int):
+    con=get_connection(); cur=con.cursor()
+    try: return cur.execute("""SELECT p.*,(SELECT COUNT(*) FROM stock s WHERE s.product_id=p.id AND s.status='available') AS available_stock FROM products p JOIN categories c ON c.id=p.category_id WHERE c.name='VPN & Proxy' AND p.is_active=1 AND p.validity_days=? ORDER BY p.sort_order,p.id""",(int(days),)).fetchall()
+    finally: con.close()
 
 def database_health_check() -> bool:
     try:
