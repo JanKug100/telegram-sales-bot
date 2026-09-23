@@ -591,9 +591,6 @@ async def purchase_method_selected(update,context):
     pay_amount=f"${state['required']:.2f}" if currency=="USD" else f"{local_amount:.2f} {currency} (USD value ${state['required']:.2f})"
     details=str(method["details"] or "Not configured yet")
     await q.answer(); await q.edit_message_text(f"💳 PAYMENT REQUEST\n━━━━━━━━━━━━━━━━\n\nPayment #{payment_id}\nProduct: {state['product_name']} x{state['quantity']}\nPurchase total: ${state['total']:.2f}\nCurrent balance: ${state['balance']:.2f}\nPayment required: ${state['required']:.2f}\n\nMethod: {method['name']}\nPay: {pay_amount}\n\n📌 Payment Details:\n{details}\n\nSend payment, then send the transaction/order ID here.\nAfter admin confirmation, your purchase will complete automatically.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data=f"cancel_user_payment:{payment_id}")]]))
-    for admin_id in ADMIN_IDS:
-        try: await context.bot.send_message(admin_id,f"🔔 NEW PURCHASE PAYMENT\nPayment #{payment_id}\nUser: {update.effective_user.id}\nProduct: {state['product_name']} x{state['quantity']}\nRequired: ${state['required']:.2f}\nMethod: {method['name']}\nLocal amount: {local_amount:.2f} {currency}\nWaiting for transaction ID.")
-        except Exception: pass
 
 
 async def enter_payment(update, context):
@@ -709,9 +706,6 @@ async def balance_method_selected(update,context):
     context.user_data["awaiting_payment_tx"]=payment_id; context.user_data.pop("balance_payment_amount",None)
     details=str(method["details"] or "Not configured yet"); pay_amount=f"${amount:.2f}" if currency=="USD" else f"{local_amount:.2f} {currency} (USD value ${amount:.2f})"
     await q.answer(); await q.edit_message_text(f"💳 {method['name'].upper()}\n━━━━━━━━━━━━━━━━\n\nPayment #{payment_id}\nPay: {pay_amount}\n\n📌 Payment Details:\n{details}\n\nAfter sending payment, send your transaction/order ID here.\nAdmin will verify and credit your USD balance.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data=f"cancel_user_payment:{payment_id}")]]))
-    for admin_id in ADMIN_IDS:
-        try: await context.bot.send_message(admin_id,f"🔔 NEW BALANCE PAYMENT\nPayment #{payment_id}\nUser: {update.effective_user.id}\nAmount: ${amount:.2f}\nMethod: {method['name']}\nLocal amount: {local_amount:.2f} {currency}\nWaiting for transaction ID.")
-        except Exception: pass
 
 
 async def create_balance_payment_from_text(update,context,amount):
