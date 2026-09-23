@@ -161,6 +161,40 @@ def init_db():
                 cursor.execute("""INSERT INTO products(category_id,product_key,name,price,product_type,validity_days)
                                   VALUES(?,?,?,?,?,?)""", (category_id,key,name,price,"stock",validity))
 
+        # Group the original Communication Apps into the intended parent/sub-category layout.
+        # This runs safely on existing databases: it only creates a parent group when one does not exist.
+        default_comm_groups = [
+            ("Google Voice", "comm_group_google_voice", ["gv_old", "gv_new"], 1),
+            ("TextNow", "comm_group_textnow", ["tn_web", "tn_phone"], 2),
+            ("TextFree", "comm_group_textfree", ["tf_web", "tf_phone"], 3),
+            ("Sideline", "comm_group_sideline", ["sl_web", "sl_phone"], 4),
+        ]
+        for group_name, group_key, child_keys, group_order in default_comm_groups:
+            parent = cursor.execute(
+                "SELECT id FROM products WHERE product_key=? AND category_id=? AND product_type='group'",
+                (group_key, comm_id)
+            ).fetchone()
+            if parent:
+                parent_id = int(parent["id"])
+            else:
+                cursor.execute(
+                    """INSERT INTO products(category_id,product_key,name,description,price,product_type,validity_days,is_active,sort_order)
+                       VALUES(?,?,?,?,?,?,?,1,?)""",
+                    (comm_id, group_key, group_name, f"{group_name} products", 0.0, "group", None, group_order)
+                )
+                parent_id = cursor.lastrowid
+
+            for child_order, child_key in enumerate(child_keys, 1):
+                child = cursor.execute(
+                    "SELECT id,parent_product_id FROM products WHERE product_key=? AND category_id=?",
+                    (child_key, comm_id)
+                ).fetchone()
+                if child:
+                    cursor.execute(
+                        "UPDATE products SET parent_product_id=?, sort_order=?, is_active=1 WHERE id=?",
+                        (parent_id, child_order, int(child["id"]))
+                    )
+
         # Existing Communication Apps products get the same sensible default fields
         # used by the current Add Stock screen. Admins can change these anytime.
         comm_products = cursor.execute("SELECT id FROM products WHERE category_id=?", (comm_id,)).fetchall()
