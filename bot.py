@@ -43,6 +43,55 @@ def ensure_user(update: Update):
     return get_user(user.id)
 
 
+def is_blocked_customer(user_id: int) -> bool:
+    """Return True only for blocked non-admin customers."""
+    if not user_id or user_id in ADMIN_IDS:
+        return False
+    user = get_user(user_id)
+    return bool(user and int(user["is_blocked"] or 0) == 1)
+
+
+async def blocked_customer_callback_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop blocked customers from using old or newly rendered inline buttons."""
+    user = update.effective_user
+    q = update.callback_query
+    if not user or not q:
+        return
+    if not is_blocked_customer(user.id):
+        return
+
+    context.user_data.clear()
+    try:
+        await q.answer("🚫 Your account is blocked. Please contact support.", show_alert=True)
+    except Exception:
+        pass
+    try:
+        await q.edit_message_text(
+            "🚫 ACCOUNT BLOCKED\n"
+            "━━━━━━━━━━━━━━━━\n\n"
+            "Your account has been blocked by the administrator.\n\n"
+            f"Please contact {SUPPORT_USERNAME} for assistance."
+        )
+    except Exception:
+        pass
+
+
+async def blocked_customer_message_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop blocked customers from continuing text-based customer flows."""
+    user = update.effective_user
+    if not user or not is_blocked_customer(user.id):
+        return
+
+    context.user_data.clear()
+    if update.message:
+        await update.message.reply_text(
+            "🚫 ACCOUNT BLOCKED\n"
+            "━━━━━━━━━━━━━━━━\n\n"
+            "Your account has been blocked by the administrator.\n\n"
+            f"Please contact {SUPPORT_USERNAME} for assistance."
+        )
+
+
 def main_menu_keyboard(user_id=None):
     rows = [
         [InlineKeyboardButton("📱 Communication Apps", callback_data="communication_apps"), InlineKeyboardButton("🔐 BUY VPN", callback_data="buy_vpn")],
@@ -239,6 +288,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         create_user(user.id, user.username, user.first_name, user.last_name, referred_by)
     else:
         update_user(user.id, user.username, user.first_name, user.last_name)
+
+    # Blocked customers must not regain access through /start.
+    if is_blocked_customer(user.id):
+        await update.message.reply_text(
+            "🚫 ACCOUNT BLOCKED\n"
+            "━━━━━━━━━━━━━━━━\n\n"
+            "Your account has been blocked by the administrator.\n\n"
+            f"Please contact {SUPPORT_USERNAME} for assistance."
+        )
+        return
 
     await update.message.reply_text(
         f"🏠 {STORE_NAME}\n━━━━━━━━━━━━━━━━\n\nWelcome to the store!\n\nChoose an option below.",
@@ -2041,6 +2100,12 @@ def main():
     application=Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start",start))
+    # Group -1 runs before all normal callback/message handlers.
+    # Returning without handling lets admins and active customers continue normally.
+    application.add_handler(
+        CallbackQueryHandler(blocked_customer_callback_guard, pattern=r"^.*$"),
+        group=-1,
+    )
     application.add_handler(CommandHandler("pending_payments",pending_payments))
     application.add_handler(CommandHandler("approve_payment",approve_payment_cmd))
     application.add_handler(CommandHandler("cancel_payment",cancel_payment_cmd))
@@ -2168,6 +2233,10 @@ def main():
         if await process_custom_quantity(update,context): return
         if await add_balance_text_handler(update,context): return
         await text_message_handler(update,context)
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, blocked_customer_message_guard),
+        group=-1,
+    )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_router))
     application.add_error_handler(error_handler)
 
