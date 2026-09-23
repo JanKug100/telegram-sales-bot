@@ -3,7 +3,7 @@ from io import BytesIO
 import io
 import csv
 import asyncio
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters, ApplicationHandlerStop
 
 from config import (
     BOT_TOKEN, SUPPORT_USERNAME, STORE_NAME,
@@ -90,6 +90,7 @@ async def blocked_customer_message_guard(update: Update, context: ContextTypes.D
             "Your account has been blocked by the administrator.\n\n"
             f"Please contact {SUPPORT_USERNAME} for assistance."
         )
+    raise ApplicationHandlerStop
 
 
 def main_menu_keyboard(user_id=None):
