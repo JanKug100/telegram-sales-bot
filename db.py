@@ -42,6 +42,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, category_id INTEGER, product_key TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL, description TEXT, price REAL NOT NULL DEFAULT 0.0,
             product_type TEXT NOT NULL DEFAULT 'stock', validity_days INTEGER,
+            parent_product_id INTEGER,
             is_active INTEGER NOT NULL DEFAULT 1, sort_order INTEGER NOT NULL DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL)""")
@@ -102,6 +103,7 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id), FOREIGN KEY(product_id) REFERENCES products(id),
             FOREIGN KEY(payment_id) REFERENCES payments(id), FOREIGN KEY(order_id) REFERENCES orders(id))""")
 
+        _add_column_if_missing(cursor, "products", "parent_product_id INTEGER", "parent_product_id")
         _add_column_if_missing(cursor, "payments", "purchase_intent_id INTEGER", "purchase_intent_id")
         _add_column_if_missing(cursor, "payments", "confirmed_by INTEGER", "confirmed_by")
         _add_column_if_missing(cursor, "payments", "confirmed_at TIMESTAMP", "confirmed_at")
@@ -169,6 +171,10 @@ def init_db():
             for order, field_name in enumerate(default_fields, 1):
                 cursor.execute("""INSERT OR IGNORE INTO product_stock_fields(product_id,field_name,sort_order)
                                   VALUES(?,?,?)""", (product_id, field_name, order))
+
+        # Communication Apps hierarchy migration. Existing stock/order rows keep their
+        # original product IDs; only a parent group relationship is added.
+        _ensure_communication_groups(cursor, comm_id)
 
         cursor.execute("SELECT id FROM payment_methods WHERE method_type='binance_pay'")
         if not cursor.fetchone():
@@ -248,7 +254,9 @@ def set_setting(key: str, value: Any):
 
 
 def get_product_by_key(product_key: str):
-    connection=get_connection(); cursor=connection.cursor(); cursor.execute("SELECT * FROM products WHERE product_key=?",(product_key,))
+    connection=get_connection(); cursor=connection.cursor(); cursor.execute("""SELECT p.*, c.name AS category_name
+        FROM products p LEFT JOIN categories c ON c.id=p.category_id
+        WHERE p.product_key=?""",(product_key,))
     row=cursor.fetchone(); connection.close(); return row
 
 
@@ -481,6 +489,124 @@ def admin_dashboard_stats():
     finally:
         con.close()
 
+
+
+def _unique_product_key(cursor, base: str) -> str:
+    import re
+    base = re.sub(r"[^a-z0-9]+", "_", str(base).lower()).strip("_") or "product"
+    key = base[:70]
+    n = 2
+    while cursor.execute("SELECT 1 FROM products WHERE product_key=?", (key,)).fetchone():
+        suffix = f"_{n}"
+        key = (base[:70-len(suffix)] + suffix).strip("_")
+        n += 1
+    return key
+
+
+def _ensure_comm_group(cursor, comm_id: int, name: str, sort_order: int):
+    row = cursor.execute(
+        "SELECT * FROM products WHERE category_id=? AND product_type='group' AND name=? LIMIT 1",
+        (comm_id, name),
+    ).fetchone()
+    if row:
+        return int(row["id"])
+    key = _unique_product_key(cursor, "comm_group_" + name)
+    cursor.execute("""INSERT INTO products(
+        category_id, product_key, name, description, price, product_type,
+        validity_days, is_active, sort_order, parent_product_id)
+        VALUES(?,?,?,?,?,?,?,?,?,NULL)""",
+        (comm_id, key, name, f"{name} communication app group", 0.0, "group", None, 1, sort_order))
+    return int(cursor.lastrowid)
+
+
+def _ensure_communication_groups(cursor, comm_id: int):
+    """Create the requested Communication Apps parent groups once and attach existing child products."""
+    groups = [
+        ("Google Voice", 1, [("gv_old", "Old GV"), ("gv_new", "New GV")]),
+        ("TextNow", 2, [("tn_web", "Web TN"), ("tn_phone", "Phone TN")]),
+        ("TextFree", 3, [("tf_web", "Web TF"), ("tf_phone", "Phone TF")]),
+        ("Sideline", 4, [("sl_web", "Web SL"), ("sl_phone", "Phone SL")]),
+    ]
+    for group_name, sort_order, children in groups:
+        parent_id = _ensure_comm_group(cursor, comm_id, group_name, sort_order)
+        for key, fallback_name in children:
+            row = cursor.execute("SELECT id FROM products WHERE product_key=?", (key,)).fetchone()
+            if row:
+                cursor.execute(
+                    "UPDATE products SET parent_product_id=? WHERE id=? AND category_id=?",
+                    (parent_id, int(row["id"]), comm_id),
+                )
+                # Keep the existing product names intact only if they already have stock/history.
+                # The customer-facing label comes from the subcategory name below.
+                desired = cursor.execute("SELECT name FROM products WHERE id=?", (int(row["id"]),)).fetchone()
+                if desired and str(desired["name"]).strip() in {
+                    "Google Voice Old", "Google Voice New", "TextNow Web", "TextNow Phone",
+                    "TextFree Web", "TextFree Phone", "Sideline Web", "Sideline Phone",
+                }:
+                    cursor.execute("UPDATE products SET name=? WHERE id=?", (fallback_name, int(row["id"])))
+        cursor.execute("UPDATE products SET is_active=1, sort_order=? WHERE id=?", (sort_order, parent_id))
+    # Direct legacy apps stay at the end of the two-column grid.
+    for key, order in (("talkatone",5),("textplus",6)):
+        cursor.execute("UPDATE products SET sort_order=? WHERE product_key=? AND category_id=?", (order,key,comm_id))
+
+
+def get_communication_products():
+    con=get_connection(); cur=con.cursor()
+    try:
+        return cur.execute("""SELECT p.*,\n            (SELECT COUNT(*) FROM products c WHERE c.parent_product_id=p.id AND c.is_active=1) AS child_count\n            FROM products p\n            WHERE p.is_active=1 AND p.product_type != 'group'\n              AND p.parent_product_id IS NULL\n              AND p.category_id=(SELECT id FROM categories WHERE name='Communication Apps' LIMIT 1)\n            UNION ALL\n            SELECT p.*,\n            (SELECT COUNT(*) FROM products c WHERE c.parent_product_id=p.id AND c.is_active=1) AS child_count\n            FROM products p\n            WHERE p.is_active=1 AND p.product_type='group'\n              AND p.parent_product_id IS NULL\n              AND p.category_id=(SELECT id FROM categories WHERE name='Communication Apps' LIMIT 1)\n            ORDER BY sort_order,id""").fetchall()
+    finally: con.close()
+
+
+def get_communication_children(parent_product_id:int):
+    con=get_connection(); cur=con.cursor()
+    try:
+        return cur.execute("""SELECT * FROM products\n            WHERE parent_product_id=? AND is_active=1\n            ORDER BY sort_order,id""", (int(parent_product_id),)).fetchall()
+    finally: con.close()
+
+
+def admin_create_communication_app(category_id:int, app_name:str, subcategories=None, direct_price:float=0.0):
+    """Create either a direct Communication App or a parent group with child products."""
+    con=get_connection(); cur=con.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cat=cur.execute("SELECT * FROM categories WHERE id=? AND is_active=1",(int(category_id),)).fetchone()
+        if not cat or str(cat["name"]).lower() != "communication apps":
+            raise ValueError("Communication Apps category not found.")
+        app_name=str(app_name).strip()
+        if not app_name or len(app_name)>100:
+            raise ValueError("App name must be 1-100 characters.")
+        items=[]
+        for item in (subcategories or []):
+            name=str(item["name"]).strip(); price=float(item["price"])
+            if not name or len(name)>100: raise ValueError("Subcategory name must be 1-100 characters.")
+            if price < 0: raise ValueError("Price cannot be negative.")
+            items.append((name, round(price,2)))
+        if items:
+            group_key=_unique_product_key(cur, "comm_group_" + app_name)
+            cur.execute("""INSERT INTO products(category_id,product_key,name,description,price,product_type,is_active,sort_order,parent_product_id)\n                           VALUES(?,?,?,?,?,?,?,?,NULL)""",
+                        (int(category_id),group_key,app_name,f"{app_name} communication app group",0.0,"group",1,999))
+            parent_id=int(cur.lastrowid)
+            child_ids=[]
+            for idx,(child_name,price) in enumerate(items,1):
+                child_key=_unique_product_key(cur, app_name + " " + child_name)
+                cur.execute("""INSERT INTO products(category_id,product_key,name,description,price,product_type,is_active,sort_order,parent_product_id)\n                               VALUES(?,?,?,?,?,?,?,?,?)""",
+                            (int(category_id),child_key,child_name,None,price,"stock",1,idx,parent_id))
+                pid=int(cur.lastrowid); child_ids.append(pid)
+                for order, field_name in enumerate(("Email / Username", "Password"),1):
+                    cur.execute("INSERT OR IGNORE INTO product_stock_fields(product_id,field_name,sort_order) VALUES(?,?,?)",(pid,field_name,order))
+            con.commit(); return {"parent_id":parent_id,"child_ids":child_ids,"product_id":parent_id,"is_group":True}
+        direct_price=float(direct_price)
+        if direct_price < 0: raise ValueError("Price cannot be negative.")
+        key=_unique_product_key(cur, app_name)
+        cur.execute("""INSERT INTO products(category_id,product_key,name,description,price,product_type,is_active,sort_order,parent_product_id)\n                       VALUES(?,?,?,?,?,?,?,?,NULL)""",
+                    (int(category_id),key,app_name,None,round(float(direct_price),2),"stock",1,999))
+        pid=int(cur.lastrowid)
+        for order, field_name in enumerate(("Email / Username", "Password"),1):
+            cur.execute("INSERT OR IGNORE INTO product_stock_fields(product_id,field_name,sort_order) VALUES(?,?,?)",(pid,field_name,order))
+        con.commit(); return {"parent_id":None,"child_ids":[],"product_id":pid,"is_group":False}
+    except Exception:
+        con.rollback(); raise
+    finally: con.close()
 
 def admin_list_products():
     con=get_connection(); cur=con.cursor()
