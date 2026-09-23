@@ -2,6 +2,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFi
 from io import BytesIO
 import io
 import csv
+import asyncio
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
 
 from config import (
@@ -22,7 +23,7 @@ from db import (
     admin_recent_orders, admin_get_order, admin_order_items, admin_list_users, admin_get_user_by_db_id,
     admin_set_user_blocked, admin_remove_user,
     admin_get_stock_fields, admin_add_stock_field, admin_rename_stock_field, admin_remove_stock_field,
-    admin_get_settings, admin_list_payment_methods, admin_get_payment_method,
+    admin_get_settings, admin_list_payment_methods, admin_get_payment_method, admin_broadcast_recipients,
     admin_create_payment_method, admin_update_payment_method,
 )
 
@@ -821,6 +822,7 @@ def admin_kb():
         [InlineKeyboardButton("👥 Referrals", callback_data="admin_referrals")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings")],
         [InlineKeyboardButton("💳 Payment Methods", callback_data="admin_payment_methods")],
+        [InlineKeyboardButton("📢 Broadcast / Notice", callback_data="admin_broadcast")],
         [InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu")],
     ])
 
@@ -1252,6 +1254,225 @@ async def admin_command_callback(update, context):
 
 
 
+# =========================
+# STAGE 5E — BROADCAST / NOTICE SYSTEM
+# =========================
+
+def _broadcast_selected_ids(context):
+    raw=context.user_data.get("broadcast_selected", [])
+    cleaned=[]
+    for value in raw:
+        try:
+            value=int(value)
+        except (TypeError, ValueError):
+            continue
+        if value not in cleaned:
+            cleaned.append(value)
+    context.user_data["broadcast_selected"]=cleaned
+    return cleaned
+
+
+def broadcast_menu_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 All Customers", callback_data="broadcast_all")],
+        [InlineKeyboardButton("🎯 Select Customers", callback_data="broadcast_select")],
+        [InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel")],
+    ])
+
+
+async def admin_broadcast(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True); return
+    context.user_data.pop("broadcast_input", None)
+    context.user_data.pop("broadcast_search", None)
+    context.user_data["broadcast_selected"]=[]
+    await q.answer()
+    recipients=len(admin_broadcast_recipients())
+    await q.edit_message_text(
+        "📢 BROADCAST / NOTICE\n━━━━━━━━━━━━━━━━\n\n"
+        f"👥 Active customers: {recipients}\n\n"
+        "Choose who should receive the notice:",
+        reply_markup=broadcast_menu_kb()
+    )
+
+
+async def broadcast_all_prompt(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True); return
+    context.user_data.pop("broadcast_search", None)
+    context.user_data["broadcast_selected"]=[]
+    context.user_data["broadcast_input"]={"mode":"all"}
+    await q.answer()
+    await q.edit_message_text(
+        "📢 SEND TO ALL ACTIVE CUSTOMERS\n━━━━━━━━━━━━━━━━\n\n"
+        "Type the notice/message you want to send.\n\n"
+        "⚠️ Blocked customers are automatically excluded.\n"
+        "You can use normal Telegram text formatting such as *bold* if your client supports it.\n\n"
+        "Send your message now:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_broadcast")]])
+    )
+
+
+def broadcast_select_kb(context, page=0, per_page=8):
+    search=str(context.user_data.get("broadcast_search") or "").strip()
+    selected=set(_broadcast_selected_ids(context))
+    # Search/list uses existing customer helper. We keep the selector small and paginated.
+    rows=admin_list_users(100, search)
+    start=page*per_page
+    current=rows[start:start+per_page]
+    kb=[]
+    for u in current:
+        uid=int(u["id"])
+        checked="✅" if uid in selected else "⬜"
+        name=f"@{u['username']}" if u["username"] else (u["first_name"] or str(u["telegram_id"]))
+        if int(u["is_blocked"]):
+            # Blocked users cannot receive broadcasts and are not selectable.
+            continue
+        kb.append([InlineKeyboardButton(f"{checked} {name} · {u['telegram_id']}", callback_data=f"broadcast_toggle:{uid}:{page}")])
+    nav=[]
+    if page>0:
+        nav.append(InlineKeyboardButton("⬅️ Previous",callback_data=f"broadcast_page:{page-1}"))
+    if start+per_page<len(rows):
+        nav.append(InlineKeyboardButton("Next ➡️",callback_data=f"broadcast_page:{page+1}"))
+    if nav: kb.append(nav)
+    kb.append([InlineKeyboardButton("🔍 Search Customer",callback_data="broadcast_search")])
+    kb.append([InlineKeyboardButton(f"✉️ Write Notice ({len(selected)} selected)",callback_data="broadcast_selected_write")])
+    kb.append([InlineKeyboardButton("🧹 Clear Selection",callback_data=f"broadcast_clear:{page}")])
+    kb.append([InlineKeyboardButton("❌ Cancel",callback_data="admin_broadcast")])
+    return InlineKeyboardMarkup(kb)
+
+
+async def broadcast_select(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True); return
+    context.user_data["broadcast_selected"]=[]
+    context.user_data.pop("broadcast_search",None)
+    await q.answer()
+    await q.edit_message_text(
+        "🎯 SELECT CUSTOMERS\n━━━━━━━━━━━━━━━━\n\n"
+        "Tap customers to select/deselect them.\n"
+        "Only active (unblocked) customers can be selected.\n\n"
+        f"Selected: {len(_broadcast_selected_ids(context))}",
+        reply_markup=broadcast_select_kb(context,0)
+    )
+
+
+async def broadcast_page(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True); return
+    page=max(0,int(q.data.split(":",1)[1]))
+    await q.answer()
+    await q.edit_message_text(
+        "🎯 SELECT CUSTOMERS\n━━━━━━━━━━━━━━━━\n\n"
+        f"Selected: {len(_broadcast_selected_ids(context))}",
+        reply_markup=broadcast_select_kb(context,page)
+    )
+
+
+async def broadcast_toggle(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True); return
+    _,uid_raw,page_raw=q.data.split(":",2)
+    uid=int(uid_raw); page=int(page_raw)
+    selected=_broadcast_selected_ids(context)
+    if uid in selected:
+        selected.remove(uid); msg="Customer deselected."
+    else:
+        user=admin_get_user_by_db_id(uid)
+        if not user or int(user["is_blocked"]):
+            await q.answer("This customer cannot receive broadcasts.",show_alert=True); return
+        selected.append(uid); msg="Customer selected."
+    context.user_data["broadcast_selected"]=selected
+    await q.answer(msg)
+    await q.edit_message_reply_markup(reply_markup=broadcast_select_kb(context,page))
+
+
+async def broadcast_clear(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True); return
+    page=int(q.data.split(":",1)[1])
+    context.user_data["broadcast_selected"]=[]
+    await q.answer("Selection cleared.")
+    await q.edit_message_reply_markup(reply_markup=broadcast_select_kb(context,page))
+
+
+async def broadcast_search_prompt(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True); return
+    context.user_data["broadcast_search_input"]=True
+    await q.answer()
+    await q.edit_message_text(
+        "🔍 SEARCH CUSTOMER FOR BROADCAST\n━━━━━━━━━━━━━━━━\n\n"
+        "Send Telegram ID, username, or customer name:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="broadcast_select")]])
+    )
+
+
+async def broadcast_selected_write(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True); return
+    selected=_broadcast_selected_ids(context)
+    active=admin_broadcast_recipients(selected)
+    selected=[int(u["id"]) for u in active]
+    context.user_data["broadcast_selected"]=selected
+    if not selected:
+        await q.answer("Select at least one active customer.",show_alert=True); return
+    context.user_data["broadcast_input"]={"mode":"selected","user_ids":selected}
+    await q.answer()
+    await q.edit_message_text(
+        "✉️ SEND TO SELECTED CUSTOMERS\n━━━━━━━━━━━━━━━━\n\n"
+        f"Selected active customers: {len(selected)}\n\n"
+        "Type the notice/message you want to send:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="broadcast_select")]])
+    )
+
+
+async def broadcast_cancel(update, context):
+    q=update.callback_query
+    if not await admin_only(update):
+        await q.answer("Admin access required.", show_alert=True); return
+    for key in ("broadcast_input","broadcast_selected","broadcast_search","broadcast_search_input"):
+        context.user_data.pop(key,None)
+    await q.answer("Cancelled.")
+    await q.edit_message_text("🔐 ADMIN PANEL\n━━━━━━━━━━━━━━━━\n\nChoose an option:",reply_markup=admin_kb())
+
+
+async def send_broadcast_message(update, context, mode_state):
+    text=(update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("❌ Message cannot be empty."); return
+    if len(text)>4096:
+        await update.message.reply_text("❌ Message is too long. Maximum is 4096 characters."); return
+    recipients=admin_broadcast_recipients(None if mode_state.get("mode")=="all" else mode_state.get("user_ids",[]))
+    total=len(recipients); sent=0; failed=0
+    await update.message.reply_text(f"📢 Broadcast started.\n\nRecipients: {total}\nPlease wait...")
+    for user in recipients:
+        try:
+            await context.bot.send_message(chat_id=int(user["telegram_id"]),text=text)
+            sent+=1
+        except Exception:
+            failed+=1
+        # Keep a safe pace for large broadcasts.
+        await asyncio.sleep(0.08)
+    admin_log(update.effective_user.id,"broadcast_notice","broadcast",None,f"mode={mode_state.get('mode')}; total={total}; sent={sent}; failed={failed}")
+    for key in ("broadcast_input","broadcast_selected","broadcast_search","broadcast_search_input"):
+        context.user_data.pop(key,None)
+    await update.message.reply_text(
+        "📢 BROADCAST COMPLETED\n━━━━━━━━━━━━━━━━\n\n"
+        f"👥 Recipients: {total}\n"
+        f"✅ Sent: {sent}\n"
+        f"❌ Failed: {failed}",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📢 Broadcast / Notice",callback_data="admin_broadcast")],[InlineKeyboardButton("🔐 Admin Panel",callback_data="admin_panel")]])
+    )
+
 # STAGE 5C — ORDERS + CUSTOMERS
 def admin_orders_kb():
     return InlineKeyboardMarkup([[InlineKeyboardButton("📦 Recent Orders",callback_data="admin_orders")],[InlineKeyboardButton("👥 Customers",callback_data="admin_customers")],[InlineKeyboardButton("🔙 Admin Panel",callback_data="admin_panel")]])
@@ -1669,6 +1890,15 @@ def main():
     application.add_handler(CommandHandler("admin",admin_command))
 
     application.add_handler(CallbackQueryHandler(admin_command_callback,pattern="^admin_panel$"))
+    application.add_handler(CallbackQueryHandler(admin_broadcast,pattern="^admin_broadcast$"))
+    application.add_handler(CallbackQueryHandler(broadcast_all_prompt,pattern="^broadcast_all$"))
+    application.add_handler(CallbackQueryHandler(broadcast_select,pattern="^broadcast_select$"))
+    application.add_handler(CallbackQueryHandler(broadcast_page,pattern="^broadcast_page:"))
+    application.add_handler(CallbackQueryHandler(broadcast_toggle,pattern="^broadcast_toggle:"))
+    application.add_handler(CallbackQueryHandler(broadcast_clear,pattern="^broadcast_clear:"))
+    application.add_handler(CallbackQueryHandler(broadcast_search_prompt,pattern="^broadcast_search$"))
+    application.add_handler(CallbackQueryHandler(broadcast_selected_write,pattern="^broadcast_selected_write$"))
+    application.add_handler(CallbackQueryHandler(broadcast_cancel,pattern="^broadcast_cancel$"))
     application.add_handler(CallbackQueryHandler(admin_settings,pattern="^admin_settings$"))
     application.add_handler(CallbackQueryHandler(admin_referrals,pattern="^admin_referrals$"))
     application.add_handler(CallbackQueryHandler(admin_referral_commission_prompt,pattern="^admin_referral_commission$"))
@@ -1753,6 +1983,19 @@ def main():
 
     # Text handler first checks active payment/amount states.
     async def text_router(update,context):
+        if context.user_data.get("broadcast_search_input") and await admin_only(update):
+            raw=(update.message.text or "").strip()
+            context.user_data.pop("broadcast_search_input",None)
+            context.user_data["broadcast_search"]=raw
+            await update.message.reply_text(
+                f"🎯 SELECT CUSTOMERS\n━━━━━━━━━━━━━━━━\n\nSearch: {raw}\nSelected: {len(_broadcast_selected_ids(context))}",
+                reply_markup=broadcast_select_kb(context,0)
+            )
+            return
+        if context.user_data.get("broadcast_input") and await admin_only(update):
+            mode_state=context.user_data.get("broadcast_input")
+            await send_broadcast_message(update,context,mode_state)
+            return
         if context.user_data.get("admin_customer_search") and await admin_only(update):
             raw=(update.message.text or "").strip(); context.user_data.pop("admin_customer_search",None); rows=admin_list_users(30,raw)
             await update.message.reply_text(f"👥 CUSTOMERS\n━━━━━━━━━━━━━━━━\n\nSearch: {raw}\nTotal shown: {len(rows)}",reply_markup=admin_customers_kb(rows)); return
