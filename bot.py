@@ -588,7 +588,26 @@ async def purchase_method_selected(update,context):
     intent=create_purchase_intent(update.effective_user.id,state["product_id"],state["quantity"],state["required"])
     rate=float(method["exchange_rate"] or 1); currency=str(method["currency"] or "USD").upper(); local_amount=round(float(state["required"])*rate,2) if currency!="USD" else round(float(state["required"]),2)
     payment_id=create_payment(update.effective_user.id,state["required"],method["method_type"],intent,currency,rate,local_amount)
-    context.user_data["awaiting_payment_tx"]=payment_id; context.user_data.pop("purchase_payment_selection",None)
+    context.user_data.pop("purchase_payment_selection",None)
+
+    if str(method["method_type"]).lower() == "binance_pay":
+        context.user_data["binance_payment_confirm"]={"payment_id":payment_id,"amount":float(state["required"]),"method_id":method_id}
+        binance_id=get_setting("binance_pay_id", "Not configured yet")
+        await q.answer()
+        await q.edit_message_text(
+            f"💳 BINANCE PAY\n━━━━━━━━━━━━━━━━\n\n"
+            f"Payment #{payment_id}\n\n"
+            f"Amount: ${float(state['required']):.2f}\n\n"
+            f"Binance Pay ID: {binance_id}\n\n"
+            "Do You Want To Confirm This Request?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Confirm",callback_data=f"binance_confirm:{payment_id}"),
+                 InlineKeyboardButton("❌ Cancel",callback_data=f"cancel_user_payment:{payment_id}")]
+            ])
+        )
+        return
+
+    context.user_data["awaiting_payment_tx"]=payment_id
     pay_amount=f"${state['required']:.2f}" if currency=="USD" else f"{local_amount:.2f} {currency} (USD value ${state['required']:.2f})"
     details=str(method["details"] or "Not configured yet")
     await q.answer(); await q.edit_message_text(f"💳 PAYMENT REQUEST\n━━━━━━━━━━━━━━━━\n\nPayment #{payment_id}\nProduct: {state['product_name']} x{state['quantity']}\nPurchase total: ${state['total']:.2f}\nCurrent balance: ${state['balance']:.2f}\nPayment required: ${state['required']:.2f}\n\nMethod: {method['name']}\nPay: {pay_amount}\n\n📌 Payment Details:\n{details}\n\nSend payment, then send the transaction/order ID here.\nAfter admin confirmation, your purchase will complete automatically.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data=f"cancel_user_payment:{payment_id}")]]))
@@ -623,8 +642,19 @@ async def text_message_handler(update, context):
         if not payment or payment["telegram_id"]!=update.effective_user.id or payment["status"]!="pending":
             context.user_data.pop("awaiting_payment_tx",None); await update.message.reply_text("This payment is no longer pending.",reply_markup=main_menu_keyboard()); return
         try:
+            checking_msg = await update.message.reply_text(
+                "🔍 CHECKING YOUR PAYMENT\n━━━━━━━━━━━━━━━━\n\nPlease Wait..."
+            )
             submit_payment_reference(payment_id,raw); context.user_data.pop("awaiting_payment_tx",None)
-            await update.message.reply_text(f"✅ Payment reference submitted.\n\nPayment #{payment_id} is waiting for admin confirmation.\nYou do not need to restart your purchase.",reply_markup=main_menu_keyboard())
+            await checking_msg.edit_text(
+                f"🔍 CHECKING YOUR PAYMENT\n━━━━━━━━━━━━━━━━\n\n"
+                "Payment reference received.\n"
+                "Your payment has been sent to admin confirmation.\n\n"
+                f"Payment #{payment_id}\n"
+                f"Transaction ID: {raw}\n\n"
+                "Please wait for admin approval.",
+                reply_markup=main_menu_keyboard()
+            )
             for admin_id in ADMIN_IDS:
                 try:
                     admin_kb = InlineKeyboardMarkup([
@@ -703,10 +733,53 @@ async def balance_method_selected(update,context):
     method=admin_get_payment_method(method_id)
     if not method or not int(method["is_active"]): await q.answer("Payment method is unavailable.",show_alert=True); return
     rate=float(method["exchange_rate"] or 1); currency=str(method["currency"] or "USD").upper(); local_amount=round(float(amount)*rate,2) if currency!="USD" else round(float(amount),2)
+
+    # Binance Pay gets a two-step confirmation before the customer enters the
+    # Binance Order/Transaction ID. Other payment methods keep their existing flow.
+    if str(method["method_type"]).lower() == "binance_pay":
+        payment_id=create_payment(update.effective_user.id,float(amount),method["method_type"],None,currency,rate,local_amount)
+        context.user_data["binance_payment_confirm"]={"payment_id":payment_id,"amount":float(amount),"method_id":method_id}
+        context.user_data.pop("balance_payment_amount",None)
+        binance_id=get_setting("binance_pay_id", "Not configured yet")
+        await q.answer()
+        await q.edit_message_text(
+            f"💳 BINANCE PAY\n━━━━━━━━━━━━━━━━\n\n"
+            f"Payment #{payment_id}\n\n"
+            f"Amount: ${float(amount):.2f}\n\n"
+            f"Binance Pay ID: {binance_id}\n\n"
+            "Do You Want To Confirm This Request?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Confirm",callback_data=f"binance_confirm:{payment_id}"),
+                 InlineKeyboardButton("❌ Cancel",callback_data=f"cancel_user_payment:{payment_id}")]
+            ])
+        )
+        return
+
     payment_id=create_payment(update.effective_user.id,float(amount),method["method_type"],None,currency,rate,local_amount)
     context.user_data["awaiting_payment_tx"]=payment_id; context.user_data.pop("balance_payment_amount",None)
     details=str(method["details"] or "Not configured yet"); pay_amount=f"${amount:.2f}" if currency=="USD" else f"{local_amount:.2f} {currency} (USD value ${amount:.2f})"
     await q.answer(); await q.edit_message_text(f"💳 {method['name'].upper()}\n━━━━━━━━━━━━━━━━\n\nPayment #{payment_id}\nPay: {pay_amount}\n\n📌 Payment Details:\n{details}\n\nAfter sending payment, send your transaction/order ID here.\nAdmin will verify and credit your USD balance.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data=f"cancel_user_payment:{payment_id}")]]))
+
+
+async def binance_confirm_callback(update,context):
+    q=update.callback_query
+    try: payment_id=int(q.data.split(":",1)[1])
+    except Exception:
+        await q.answer("Invalid payment.",show_alert=True); return
+    payment=get_payment(payment_id)
+    state=context.user_data.get("binance_payment_confirm") or {}
+    if not payment or payment["telegram_id"]!=update.effective_user.id or payment["status"]!="pending" or int(state.get("payment_id") or 0)!=payment_id:
+        await q.answer("Payment is no longer available.",show_alert=True); return
+    context.user_data.pop("binance_payment_confirm",None)
+    context.user_data["awaiting_payment_tx"]=payment_id
+    binance_id=get_setting("binance_pay_id", "Not configured yet")
+    await q.answer()
+    await q.edit_message_text(
+        f"💳 BINANCE PAY\n━━━━━━━━━━━━━━━━\n\n"
+        f"Binance Pay ID: {binance_id}\n\n"
+        "Enter your Binance Order/Transaction ID",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data=f"cancel_user_payment:{payment_id}")]])
+    )
 
 
 async def create_balance_payment_from_text(update,context,amount):
@@ -2330,6 +2403,7 @@ def main():
     application.add_handler(CallbackQueryHandler(confirm_buy,pattern="^confirmbuy:"))
     application.add_handler(CallbackQueryHandler(pay_purchase,pattern="^paypurchase:"))
     application.add_handler(CallbackQueryHandler(enter_payment,pattern="^enterpay:"))
+    application.add_handler(CallbackQueryHandler(binance_confirm_callback,pattern="^binance_confirm:"))
     application.add_handler(CallbackQueryHandler(cancel_user_payment,pattern="^cancel_user_payment:"))
     application.add_handler(CallbackQueryHandler(communication_group,pattern="^comm_group:"))
     application.add_handler(CallbackQueryHandler(communication_product,pattern="^product_"))
