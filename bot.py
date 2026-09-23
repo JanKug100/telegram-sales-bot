@@ -262,29 +262,53 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Refer", callback_data="refer")],[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]))
 
 
+def _two_column_rows(buttons):
+    """Arrange communication-app buttons two per row for a compact side-by-side layout."""
+    rows=[]
+    for i in range(0, len(buttons), 2):
+        rows.append(buttons[i:i+2])
+    return rows
+
+
 async def communication_apps(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
-    products=get_communication_products(); rows=[]
+    products=get_communication_products()
+    buttons=[]
     for p in products:
-        if str(p["product_type"]).lower()=="group": rows.append([InlineKeyboardButton(f"📱 {p['name']}",callback_data=f"comm_group:{p['id']}")])
-        else: rows.append([InlineKeyboardButton(f"{p['name']} — ${float(p['price']):.2f}",callback_data=f"comm_product:{p['id']}")])
-    if not rows: rows=[[InlineKeyboardButton("🚧 No products available",callback_data="main_menu")]]
+        if str(p["product_type"]).lower()=="group":
+            buttons.append(InlineKeyboardButton(f"📱 {p['name']}", callback_data=f"comm_group:{p['id']}"))
+        else:
+            label=f"{p['name']} — ${float(p['price']):.2f}"
+            if int(p['available_stock']) < 1:
+                label += " (Out)"
+            buttons.append(InlineKeyboardButton(label, callback_data=f"comm_product:{p['id']}"))
+    rows=_two_column_rows(buttons)
+    if not rows:
+        rows=[[InlineKeyboardButton("🚧 No products available",callback_data="main_menu")]]
     rows.append([InlineKeyboardButton("🏠 Main Menu",callback_data="main_menu")])
-    await q.edit_message_text("💬 COMMUNICATION APPS\n━━━━━━━━━━━━━━━━\n\nSelect a product:",reply_markup=InlineKeyboardMarkup(rows))
+    await q.edit_message_text(
+        "💬 COMMUNICATION APPS\n━━━━━━━━━━━━━━━━\n\nSelect a product:",
+        reply_markup=InlineKeyboardMarkup(rows)
+    )
 
 async def communication_group(update, context):
     q=update.callback_query
     try: parent_id=int(q.data.split(":",1)[1])
     except Exception: await q.answer("Invalid product.",show_alert=True); return
-    children=get_product_children(parent_id)
-    if not children: await q.answer("No sub-categories are available.",show_alert=True); return
-    await q.answer(); rows=[]
-    for p in children:
+    parent=get_product_children(parent_id)
+    if not parent: await q.answer("No sub-categories are available.",show_alert=True); return
+    await q.answer()
+    buttons=[]
+    for p in parent:
         label=f"{p['name']} — ${float(p['price']):.2f}"
         if int(p['available_stock'])<1: label += " (Out)"
-        rows.append([InlineKeyboardButton(label,callback_data=f"comm_product:{p['id']}")])
+        buttons.append(InlineKeyboardButton(label,callback_data=f"comm_product:{p['id']}"))
+    rows=_two_column_rows(buttons)
     rows.append([InlineKeyboardButton("🔙 Back",callback_data="communication_apps")])
-    await q.edit_message_text("📱 PRODUCT OPTIONS\n━━━━━━━━━━━━━━━━\n\nSelect an option:",reply_markup=InlineKeyboardMarkup(rows))
+    await q.edit_message_text(
+        "📱 PRODUCT OPTIONS\n━━━━━━━━━━━━━━━━\n\nSelect an option:",
+        reply_markup=InlineKeyboardMarkup(rows)
+    )
 
 async def communication_product_by_id(update, context):
     q=update.callback_query
