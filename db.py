@@ -454,6 +454,70 @@ def cancel_payment(payment_id:int, admin_id:int, note:Optional[str]=None):
     finally: connection.close()
 
 
+
+def get_cancelled_payments_7d(limit:int=50):
+    """Return cancelled payments from the last 7 days for admin recheck."""
+    connection=get_connection(); cursor=connection.cursor()
+    try:
+        cursor.execute("""SELECT pay.*,u.telegram_id,
+                    pi.product_id,pi.quantity,pi.total_amount,pi.status AS purchase_status
+                    FROM payments pay
+                    JOIN users u ON u.id=pay.user_id
+                    LEFT JOIN purchase_intents pi ON pi.id=pay.purchase_intent_id
+                    WHERE pay.status='cancelled'
+                      AND COALESCE(pay.confirmed_at,pay.created_at) >= datetime('now','-7 days')
+                    ORDER BY COALESCE(pay.confirmed_at,pay.created_at) DESC, pay.id DESC
+                    LIMIT ?""", (int(limit),))
+        return cursor.fetchall()
+    finally:
+        connection.close()
+
+
+def reaccept_cancelled_payment(payment_id:int, admin_id:int):
+    """Re-open a cancelled payment within 7 days and accept it atomically.
+
+    The payment is credited only once. A second admin cannot credit the same
+    payment again because the transition requires status='cancelled'.
+    """
+    connection=get_connection(); cursor=connection.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        payment=cursor.execute("SELECT * FROM payments WHERE id=?",(payment_id,)).fetchone()
+        if not payment:
+            raise ValueError("Payment not found.")
+        if payment["status"]!="cancelled":
+            raise ValueError(f"Payment is already {payment['status']}.")
+        cancelled_at=payment["confirmed_at"] or payment["created_at"]
+        valid=cursor.execute("SELECT 1 WHERE ? >= datetime('now','-7 days')",(cancelled_at,)).fetchone()
+        if not valid:
+            raise ValueError("This cancelled payment is older than 7 days.")
+        if not payment["transaction_id"]:
+            raise ValueError("This payment has no transaction/order ID.")
+
+        user=cursor.execute("SELECT id,balance FROM users WHERE id=?",(payment["user_id"],)).fetchone()
+        if not user:
+            raise ValueError("User not found.")
+        before=float(user["balance"]); amount=float(payment["amount"]); after=round(before+amount,8)
+        cursor.execute("UPDATE users SET balance=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(after,user["id"]))
+        cursor.execute("""INSERT INTO balance_transactions(user_id,transaction_type,amount,balance_before,balance_after,reference,description)
+                          VALUES(?,?,?,?,?,?,?)""",(user["id"],"payment",amount,before,after,f"payment:{payment_id}",f"Payment #{payment_id} re-accepted after cancellation"))
+        referral_commission=_apply_referral_commission_locked(cursor,payment_id,user["id"],amount)
+        cursor.execute("UPDATE payments SET status='paid',admin_note=?,approved_at=CURRENT_TIMESTAMP,confirmed_at=CURRENT_TIMESTAMP,confirmed_by=? WHERE id=? AND status='cancelled'",("Re-accepted after 7-day cancellation recheck",admin_id,payment_id))
+        if cursor.rowcount!=1:
+            raise ValueError("Payment was already processed by another admin.")
+
+        intent_id=payment["purchase_intent_id"]
+        purchase=None
+        if intent_id:
+            cursor.execute("UPDATE purchase_intents SET status='ready',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='cancelled'",(intent_id,))
+            purchase=_complete_purchase_locked(cursor,intent_id,payment_id,admin_id)
+        connection.commit()
+        return {"payment_id":payment_id,"already_paid":False,"reaccepted":True,"purchase":purchase,"referral_commission":referral_commission}
+    except Exception:
+        connection.rollback(); raise
+    finally:
+        connection.close()
+
 def get_recent_orders(telegram_id:int, hours:int=24, limit:int=20):
     connection=get_connection(); cursor=connection.cursor()
     cursor.execute("""SELECT o.*,p.name FROM orders o JOIN users u ON u.id=o.user_id JOIN products p ON p.id=o.product_id
