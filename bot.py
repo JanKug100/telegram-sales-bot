@@ -3,6 +3,8 @@ from io import BytesIO
 import io
 import csv
 import asyncio
+import re
+import uuid
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
 
 from config import (
@@ -25,6 +27,8 @@ from db import (
     admin_get_stock_fields, admin_add_stock_field, admin_rename_stock_field, admin_remove_stock_field,
     admin_get_settings, admin_list_payment_methods, admin_get_payment_method, admin_broadcast_recipients,
     admin_create_payment_method, admin_update_payment_method,
+    admin_create_communication_group, admin_create_vpn_packages,
+    get_communication_products, get_product_children, get_vpn_validities, get_vpn_products_by_validity,
 )
 
 BOT_USERNAME = None
@@ -260,8 +264,36 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def communication_apps(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
-    kb=[[InlineKeyboardButton("Google Voice",callback_data="google_voice"),InlineKeyboardButton("TextNow",callback_data="textnow")],[InlineKeyboardButton("TextFree",callback_data="textfree"),InlineKeyboardButton("Sideline",callback_data="sideline")],[InlineKeyboardButton("Talkatone",callback_data="talkatone"),InlineKeyboardButton("TextPlus",callback_data="textplus")],[InlineKeyboardButton("🏠 Main Menu",callback_data="main_menu")]]
-    await q.edit_message_text("💬 COMMUNICATION APPS\n━━━━━━━━━━━━━━━━\n\nSelect a product:",reply_markup=InlineKeyboardMarkup(kb))
+    products=get_communication_products(); rows=[]
+    for p in products:
+        if str(p["product_type"]).lower()=="group": rows.append([InlineKeyboardButton(f"📱 {p['name']}",callback_data=f"comm_group:{p['id']}")])
+        else: rows.append([InlineKeyboardButton(f"{p['name']} — ${float(p['price']):.2f}",callback_data=f"comm_product:{p['id']}")])
+    if not rows: rows=[[InlineKeyboardButton("🚧 No products available",callback_data="main_menu")]]
+    rows.append([InlineKeyboardButton("🏠 Main Menu",callback_data="main_menu")])
+    await q.edit_message_text("💬 COMMUNICATION APPS\n━━━━━━━━━━━━━━━━\n\nSelect a product:",reply_markup=InlineKeyboardMarkup(rows))
+
+async def communication_group(update, context):
+    q=update.callback_query
+    try: parent_id=int(q.data.split(":",1)[1])
+    except Exception: await q.answer("Invalid product.",show_alert=True); return
+    children=get_product_children(parent_id)
+    if not children: await q.answer("No sub-categories are available.",show_alert=True); return
+    await q.answer(); rows=[]
+    for p in children:
+        label=f"{p['name']} — ${float(p['price']):.2f}"
+        if int(p['available_stock'])<1: label += " (Out)"
+        rows.append([InlineKeyboardButton(label,callback_data=f"comm_product:{p['id']}")])
+    rows.append([InlineKeyboardButton("🔙 Back",callback_data="communication_apps")])
+    await q.edit_message_text("📱 PRODUCT OPTIONS\n━━━━━━━━━━━━━━━━\n\nSelect an option:",reply_markup=InlineKeyboardMarkup(rows))
+
+async def communication_product_by_id(update, context):
+    q=update.callback_query
+    try: pid=int(q.data.split(":",1)[1])
+    except Exception: await q.answer("Invalid product.",show_alert=True); return
+    p=admin_get_product(pid)
+    if not p: await q.answer("Product not found.",show_alert=True); return
+    if str(p["product_type"]).lower()=="group": return await communication_group(update,context)
+    await show_product_for_purchase(update,context,p["product_key"])
 
 
 def simple_two_product_screen(title, products, back="communication_apps"):
@@ -554,7 +586,32 @@ async def text_message_handler(update, context):
 
 
 async def buy_vpn(update, context):
-    q=update.callback_query; await q.answer(); kb=[[InlineKeyboardButton("03 Days",callback_data="vpn_03_days"),InlineKeyboardButton("07 Days",callback_data="vpn_07_days")],[InlineKeyboardButton("14 Days",callback_data="vpn_14_days"),InlineKeyboardButton("30 Days",callback_data="vpn_30_days")],[InlineKeyboardButton("🏠 Main Menu",callback_data="main_menu")]]; await q.edit_message_text("🔐 BUY VPN\n━━━━━━━━━━━━━━━━\n\n📅 Select validity:",reply_markup=InlineKeyboardMarkup(kb))
+    q=update.callback_query; await q.answer(); vals=get_vpn_validities()
+    if not vals: await q.edit_message_text("🔐 BUY VPN\n━━━━━━━━━━━━━━━━\n\n🚧 No VPN packages are currently available.",reply_markup=back_main_keyboard()); return
+    rows=[]; row=[]
+    for days in vals:
+        row.append(InlineKeyboardButton(f"{days:02d} Days" if days<100 else f"{days} Days",callback_data=f"vpn_validity:{days}"))
+        if len(row)==2: rows.append(row); row=[]
+    if row: rows.append(row)
+    rows.append([InlineKeyboardButton("🏠 Main Menu",callback_data="main_menu")])
+    await q.edit_message_text("🔐 BUY VPN\n━━━━━━━━━━━━━━━━\n\n📅 Select validity:",reply_markup=InlineKeyboardMarkup(rows))
+
+async def vpn_validity_products(update, context):
+    q=update.callback_query
+    try: days=int(q.data.split(":",1)[1])
+    except Exception: await q.answer("Invalid validity.",show_alert=True); return
+    products=get_vpn_products_by_validity(days)
+    if not products: await q.answer("No VPNs found for this validity.",show_alert=True); return
+    await q.answer(); rows=[]
+    for p in products:
+        label=str(p["name"])
+        for suffix in (f" — {days:02d} Days",f" — {days} Days"):
+            if label.endswith(suffix): label=label[:-len(suffix)]; break
+        if int(p["available_stock"])<1: label += " (Out)"
+        rows.append([InlineKeyboardButton(label,callback_data=f"vpn_product_{p['product_key']}")])
+    rows.append([InlineKeyboardButton("🔙 Back",callback_data="buy_vpn")])
+    await q.edit_message_text(f"🔐 VPN — {days:02d} DAYS\n━━━━━━━━━━━━━━━━\n\nSelect a VPN:",reply_markup=InlineKeyboardMarkup(rows))
+
 
 async def vpn_03_days(update,context):
     q=update.callback_query; await q.answer(); kb=[[InlineKeyboardButton("Express VPN",callback_data="vpn_product_express_3"),InlineKeyboardButton("CyberGhost VPN",callback_data="vpn_product_cyberghost_3")],[InlineKeyboardButton("Vypr VPN",callback_data="vpn_product_vypr_3"),InlineKeyboardButton("Panda VPN",callback_data="vpn_product_panda_3")],[InlineKeyboardButton("🔙 Back",callback_data="buy_vpn")]]; await q.edit_message_text("🔐 VPN — 03 DAYS\n━━━━━━━━━━━━━━━━\n\nSelect a VPN:",reply_markup=InlineKeyboardMarkup(kb))
@@ -864,7 +921,7 @@ def admin_products_kb(products, page=0, per_page=8):
     for p in current:
         status = "🟢" if int(p["is_active"]) else "🔴"
         rows.append([InlineKeyboardButton(
-            f"{status} {p['name']} — ${float(p['price']):.2f}",
+            f"{status} {p['name']}" + (f" — ${float(p['price']):.2f}" if str(p["product_type"]).lower() != "group" else " — Sub Categories"),
             callback_data=f"admin_product:{p['id']}"
         )])
     nav = []
@@ -875,11 +932,14 @@ def admin_products_kb(products, page=0, per_page=8):
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton("➕ Add Product", callback_data="admin_add_product")])
+    rows.append([InlineKeyboardButton("🔐 Add VPN", callback_data="admin_add_vpn")])
     rows.append([InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel")])
     return InlineKeyboardMarkup(rows)
 
 
 async def admin_products(update, context, page=0):
+    context.user_data.pop("admin_input",None)
+    _clear_product_wizard(context)
     q = update.callback_query
     if not await admin_only(update):
         await q.answer("Admin access required.", show_alert=True)
@@ -1036,27 +1096,110 @@ async def admin_delete_product_confirm(update, context):
     await admin_products(update, context)
 
 
+def _make_key(prefix):
+    cleaned=re.sub(r"[^a-z0-9]+","_",str(prefix).lower()).strip("_") or "product"
+    return f"{cleaned}_{uuid.uuid4().hex[:8]}"
+
+def _clear_product_wizard(context):
+    context.user_data.pop("product_wizard",None); context.user_data.pop("vpn_wizard",None)
+
 async def admin_add_product_prompt(update, context):
-    q = update.callback_query
+    q=update.callback_query
+    if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
+    _clear_product_wizard(context); rows=[]
+    for c in admin_list_categories(): rows.append([InlineKeyboardButton(f"{c['emoji'] or ''} {c['name']}",callback_data=f"admin_add_product_category:{c['id']}")])
+    rows.append([InlineKeyboardButton("🔙 Products",callback_data="admin_products")])
+    await q.answer(); await q.edit_message_text("➕ ADD PRODUCT\n━━━━━━━━━━━━━━━━\n\nChoose the category:",reply_markup=InlineKeyboardMarkup(rows))
+
+async def admin_add_product_category(update, context):
+    q=update.callback_query
+    if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
+    cid=int(q.data.split(":",1)[1]); cats={int(c["id"]):c for c in admin_list_categories()}; cat=cats.get(cid)
+    if not cat: await q.answer("Category not found.",show_alert=True); return
+    if str(cat["name"]).lower()=="vpn & proxy": return await admin_add_vpn_prompt(update,context)
+    context.user_data["product_wizard"]={"category_id":cid,"category_name":cat["name"]}; context.user_data["admin_input"]={"kind":"comm_product_name"}
+    await q.answer(); await q.edit_message_text(f"➕ ADD PRODUCT\n━━━━━━━━━━━━━━━━\n\nCategory: {cat['name']}\n\nEnter the Product Name.\n\nExample: Index",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_products")]]))
+
+async def admin_add_vpn_prompt(update, context):
+    q=update.callback_query
+    if not await admin_only(update): await q.answer("Admin access required.",show_alert=True); return
+    cat=next((c for c in admin_list_categories() if str(c["name"]).lower()=="vpn & proxy"),None)
+    if not cat: await q.answer("VPN category not found.",show_alert=True); return
+    _clear_product_wizard(context); context.user_data["vpn_wizard"]={"category_id":int(cat["id"])}; context.user_data["admin_input"]={"kind":"vpn_name"}
+    await q.answer(); await q.edit_message_text("➕ ADD VPN\n━━━━━━━━━━━━━━━━\n\nVPN Name:\n\nEnter the VPN name.\n\nExample: Mullvad",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_products")]]))
+
+def _vpn_validity_keyboard(state):
+    selected=set(state.get("validities",[])); rows=[]
+    for a,c in ((3,7),(14,30)):
+        rows.append([InlineKeyboardButton(("☑" if a in selected else "☐")+f" {a:02d} Days",callback_data=f"vpn_wiz_toggle:{a}"),InlineKeyboardButton(("☑" if c in selected else "☐")+f" {c:02d} Days",callback_data=f"vpn_wiz_toggle:{c}")])
+    rows.append([InlineKeyboardButton("🖊️ Customise",callback_data="vpn_wiz_custom")])
+    if selected: rows.append([InlineKeyboardButton("✅ Continue",callback_data="vpn_wiz_done")])
+    rows.append([InlineKeyboardButton("❌ Cancel",callback_data="admin_products")]); return InlineKeyboardMarkup(rows)
+
+async def vpn_wizard_validity(update, context):
     if not await admin_only(update):
-        await q.answer("Admin access required.", show_alert=True)
+        await update.callback_query.answer("Admin access required.",show_alert=True); return
+    q=update.callback_query if update.callback_query else None; state=context.user_data.get("vpn_wizard")
+    if not state:
+        if q: await q.answer("VPN setup expired.",show_alert=True)
         return
-    cats = admin_list_categories()
-    cat_lines = "\n".join([f"{c['id']} = {c['name']}" for c in cats])
-    context.user_data["admin_input"] = {"kind": "add_product"}
-    await q.answer()
-    await q.edit_message_text(
-        "➕ ADD PRODUCT\n━━━━━━━━━━━━━━━━\n\n"
-        "Send the product details in ONE message using:\n\n"
-        "category_id | product_key | product_name | price\n\n"
-        "Example:\n"
-        "1 | gv_new2 | Google Voice New 2 | 3.50\n\n"
-        "Available categories:\n" + cat_lines +
-        "\n\nProduct will be created as Active.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data="admin_products")]
-        ])
-    )
+    text=f"➕ ADD VPN\n━━━━━━━━━━━━━━━━\n\nVPN Name: {state['name']}\n\nValidity:"
+    if q: await q.answer(); await q.edit_message_text(text,reply_markup=_vpn_validity_keyboard(state))
+    else: await update.message.reply_text(text,reply_markup=_vpn_validity_keyboard(state))
+
+async def vpn_wizard_toggle(update, context):
+    if not await admin_only(update):
+        await update.callback_query.answer("Admin access required.",show_alert=True); return
+    q=update.callback_query; state=context.user_data.get("vpn_wizard")
+    if not state: await q.answer("VPN setup expired.",show_alert=True); return
+    days=int(q.data.split(":",1)[1]); vals=set(state.get("validities",[])); vals.remove(days) if days in vals else vals.add(days); state["validities"]=sorted(vals); await vpn_wizard_validity(update,context)
+
+async def vpn_wizard_custom(update, context):
+    if not await admin_only(update):
+        await update.callback_query.answer("Admin access required.",show_alert=True); return
+    q=update.callback_query; context.user_data["admin_input"]={"kind":"vpn_custom_days"}; await q.answer(); await q.edit_message_text("🖊️ CUSTOMISE VALIDITY\n━━━━━━━━━━━━━━━━\n\nEnter number of days.\n\nExample: 60",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back",callback_data="vpn_wiz_back")]]))
+
+async def vpn_wizard_back(update, context):
+    if not await admin_only(update):
+        await update.callback_query.answer("Admin access required.",show_alert=True); return
+    context.user_data.pop("admin_input",None); await vpn_wizard_validity(update,context)
+
+async def vpn_wizard_done(update, context):
+    if not await admin_only(update):
+        await update.callback_query.answer("Admin access required.",show_alert=True); return
+    q=update.callback_query; state=context.user_data.get("vpn_wizard")
+    if not state or not state.get("validities"): await q.answer("Select at least one validity.",show_alert=True); return
+    state["price_index"]=0; state["prices"]={}; context.user_data["admin_input"]={"kind":"vpn_price"}; days=state["validities"][0]
+    await q.answer(); await q.edit_message_text(f"➕ ADD VPN\n━━━━━━━━━━━━━━━━\n\nVPN Name: {state['name']}\n\n{days:02d} Days Price:\nSend the USD price.\n\nExample: 1.50",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_products")]]))
+
+async def _finish_vpn_creation(update, context):
+    state=context.user_data.get("vpn_wizard")
+    packages=[(d,state["prices"][d],_make_key(f"{state['name']}_{d}d")) for d in state["validities"]]
+    ids=admin_create_vpn_packages(state["category_id"],state["name"],packages); admin_log(update.effective_user.id,"add_vpn","product",ids[0],state["name"])
+    summary="\n".join(f"• {d:02d} Days — ${state['prices'][d]:.2f}" for d in state["validities"]); name=state["name"]; _clear_product_wizard(context); context.user_data.pop("admin_input",None)
+    await update.message.reply_text(f"✅ VPN ADDED SUCCESSFULLY\n━━━━━━━━━━━━━━━━\n\n🔐 {name}\n\n{summary}\n\nAll packages are Active with 0 stock.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛍️ Products",callback_data="admin_products")],[InlineKeyboardButton("🔐 Admin Panel",callback_data="admin_panel")]]))
+
+async def comm_wizard_yes(update, context):
+    if not await admin_only(update):
+        await update.callback_query.answer("Admin access required.",show_alert=True); return
+    q=update.callback_query; state=context.user_data.get("product_wizard"); context.user_data["admin_input"]={"kind":"comm_variant_name"}; await q.answer(); await q.edit_message_text(f"➕ ADD PRODUCT\n━━━━━━━━━━━━━━━━\n\nProduct: {state['product_name']}\n\nEnter the first Sub Category name.\n\nExample: TP Web",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_products")]]))
+
+async def comm_wizard_no(update, context):
+    if not await admin_only(update):
+        await update.callback_query.answer("Admin access required.",show_alert=True); return
+    q=update.callback_query; state=context.user_data.get("product_wizard"); context.user_data["admin_input"]={"kind":"comm_direct_price"}; await q.answer(); await q.edit_message_text(f"➕ ADD PRODUCT\n━━━━━━━━━━━━━━━━\n\nProduct: {state['product_name']}\n\nEnter the USD price.\n\nExample: 2.00",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_products")]]))
+
+async def comm_wizard_add_more(update, context):
+    if not await admin_only(update):
+        await update.callback_query.answer("Admin access required.",show_alert=True); return
+    q=update.callback_query; context.user_data["admin_input"]={"kind":"comm_variant_name"}; await q.answer(); await q.edit_message_text("Enter the next Sub Category name.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_products")]]))
+
+async def comm_wizard_done(update, context):
+    if not await admin_only(update):
+        await update.callback_query.answer("Admin access required.",show_alert=True); return
+    q=update.callback_query; state=context.user_data.get("product_wizard")
+    if not state or not state.get("variants"): await q.answer("Add at least one Sub Category.",show_alert=True); return
+    variants=[(n,p,_make_key(f"{state['product_name']}_{n}")) for n,p in state["variants"]]; pid=admin_create_communication_group(state["category_id"],_make_key(state["product_name"]),state["product_name"],variants); admin_log(update.effective_user.id,"add_product_group","product",pid,state["product_name"]); summary="\n".join(f"• {n} — ${p:.2f}" for n,p in state["variants"]); name=state["product_name"]; _clear_product_wizard(context); context.user_data.pop("admin_input",None); await q.answer(); await q.edit_message_text(f"✅ PRODUCT ADDED\n━━━━━━━━━━━━━━━━\n\n📱 {name}\n\n{summary}\n\nProduct and Sub Categories are Active with 0 stock.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛍️ Products",callback_data="admin_products")],[InlineKeyboardButton("🔐 Admin Panel",callback_data="admin_panel")]]))
 
 
 async def admin_input_handler(update, context) -> bool:
@@ -1130,6 +1273,30 @@ async def admin_input_handler(update, context) -> bool:
             )
             return True
 
+        if kind == "comm_product_name":
+            if not 1<=len(raw)<=100: raise ValueError("Product name must be 1-100 characters.")
+            state=context.user_data.get("product_wizard"); state["product_name"]=raw; context.user_data["admin_input"]=None
+            await update.message.reply_text(f"➕ ADD PRODUCT\n━━━━━━━━━━━━━━━━\n\nCategory: {state['category_name']}\nProduct: {raw}\n\nDoes this product have Sub Categories?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes",callback_data="comm_wiz_yes"),InlineKeyboardButton("❌ No",callback_data="comm_wiz_no")],[InlineKeyboardButton("❌ Cancel",callback_data="admin_products")]])); return True
+        if kind == "comm_direct_price":
+            price=float(raw); state=context.user_data.get("product_wizard"); pid=admin_create_product(state["category_id"],_make_key(state["product_name"]),state["product_name"],price); admin_log(update.effective_user.id,"add_product","product",pid,state["product_name"]); name=state["product_name"]; _clear_product_wizard(context); context.user_data.pop("admin_input",None); await update.message.reply_text(f"✅ PRODUCT ADDED\n━━━━━━━━━━━━━━━━\n\n📱 {name}\n💰 ${price:.2f}\n\nActive with 0 stock.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛍️ Products",callback_data="admin_products")]])); return True
+        if kind == "comm_variant_name":
+            if not 1<=len(raw)<=100: raise ValueError("Sub Category name must be 1-100 characters.")
+            state=context.user_data.get("product_wizard"); state["pending_variant_name"]=raw; context.user_data["admin_input"]={"kind":"comm_variant_price"}; await update.message.reply_text(f"Sub Category: {raw}\n\nEnter its USD price.\nExample: 2.00",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_products")]])); return True
+        if kind == "comm_variant_price":
+            price=float(raw); state=context.user_data.get("product_wizard"); state.setdefault("variants",[]).append((state.pop("pending_variant_name"),price)); context.user_data["admin_input"]=None; await update.message.reply_text(f"✅ Added.\n\nSub Categories: {len(state['variants'])}\n\nAdd another?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add Another",callback_data="comm_wiz_add_more"),InlineKeyboardButton("✅ Done",callback_data="comm_wiz_done")],[InlineKeyboardButton("❌ Cancel",callback_data="admin_products")]])); return True
+        if kind == "vpn_name":
+            if not 1<=len(raw)<=80: raise ValueError("VPN name must be 1-80 characters.")
+            state=context.user_data.get("vpn_wizard"); state["name"]=raw; context.user_data["admin_input"]=None; await vpn_wizard_validity(update,context); return True
+        if kind == "vpn_custom_days":
+            days=int(raw); state=context.user_data.get("vpn_wizard");
+            if days<1 or days>3650: raise ValueError("Enter a validity between 1 and 3650 days.")
+            if days not in state.get("validities",[]): state.setdefault("validities",[]).append(days); state["validities"].sort()
+            context.user_data["admin_input"]=None; await update.message.reply_text(f"✅ {days} Days added.",reply_markup=_vpn_validity_keyboard(state)); return True
+        if kind == "vpn_price":
+            price=float(raw); state=context.user_data.get("vpn_wizard"); idx=state["price_index"]; days=state["validities"][idx]; state.setdefault("prices",{})[days]=price; idx+=1
+            if idx<len(state["validities"]):
+                state["price_index"]=idx; nd=state["validities"][idx]; await update.message.reply_text(f"➕ ADD VPN\n━━━━━━━━━━━━━━━━\n\nVPN Name: {state['name']}\n\n{nd:02d} Days Price:\nSend the USD price.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel",callback_data="admin_products")]])); return True
+            await _finish_vpn_creation(update,context); return True
         if kind == "usd_bdt_rate":
             rate=float(raw)
             if rate<=0: raise ValueError("Rate must be greater than 0.")
@@ -1922,6 +2089,16 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_delete_product_prompt,pattern="^admin_delete:"))
     application.add_handler(CallbackQueryHandler(admin_delete_product_confirm,pattern="^admin_delete_confirm:"))
     application.add_handler(CallbackQueryHandler(admin_add_product_prompt,pattern="^admin_add_product$"))
+    application.add_handler(CallbackQueryHandler(admin_add_product_category,pattern="^admin_add_product_category:"))
+    application.add_handler(CallbackQueryHandler(admin_add_vpn_prompt,pattern="^admin_add_vpn$"))
+    application.add_handler(CallbackQueryHandler(comm_wizard_yes,pattern="^comm_wiz_yes$"))
+    application.add_handler(CallbackQueryHandler(comm_wizard_no,pattern="^comm_wiz_no$"))
+    application.add_handler(CallbackQueryHandler(comm_wizard_add_more,pattern="^comm_wiz_add_more$"))
+    application.add_handler(CallbackQueryHandler(comm_wizard_done,pattern="^comm_wiz_done$"))
+    application.add_handler(CallbackQueryHandler(vpn_wizard_toggle,pattern="^vpn_wiz_toggle:"))
+    application.add_handler(CallbackQueryHandler(vpn_wizard_custom,pattern="^vpn_wiz_custom$"))
+    application.add_handler(CallbackQueryHandler(vpn_wizard_back,pattern="^vpn_wiz_back$"))
+    application.add_handler(CallbackQueryHandler(vpn_wizard_done,pattern="^vpn_wiz_done$"))
     application.add_handler(CallbackQueryHandler(admin_orders,pattern="^admin_orders$"))
     application.add_handler(CallbackQueryHandler(admin_order_detail,pattern="^admin_order:"))
     application.add_handler(CallbackQueryHandler(admin_customers,pattern="^admin_customers$"))
@@ -1948,6 +2125,8 @@ def main():
     application.add_handler(CallbackQueryHandler(show_main_menu,pattern="^main_menu$"))
     application.add_handler(CallbackQueryHandler(show_profile,pattern="^my_profile$"))
     application.add_handler(CallbackQueryHandler(communication_apps,pattern="^communication_apps$"))
+    application.add_handler(CallbackQueryHandler(communication_group,pattern="^comm_group:"))
+    application.add_handler(CallbackQueryHandler(communication_product_by_id,pattern="^comm_product:"))
     application.add_handler(CallbackQueryHandler(google_voice,pattern="^google_voice$"))
     application.add_handler(CallbackQueryHandler(textnow,pattern="^textnow$"))
     application.add_handler(CallbackQueryHandler(textfree,pattern="^textfree$"))
@@ -1963,6 +2142,7 @@ def main():
     application.add_handler(CallbackQueryHandler(cancel_user_payment,pattern="^cancel_user_payment:"))
     application.add_handler(CallbackQueryHandler(communication_product,pattern="^product_"))
     application.add_handler(CallbackQueryHandler(buy_vpn,pattern="^buy_vpn$"))
+    application.add_handler(CallbackQueryHandler(vpn_validity_products,pattern="^vpn_validity:"))
     application.add_handler(CallbackQueryHandler(vpn_03_days,pattern="^vpn_03_days$"))
     application.add_handler(CallbackQueryHandler(vpn_07_days,pattern="^vpn_07_days$"))
     application.add_handler(CallbackQueryHandler(vpn_07_page_2,pattern="^vpn_07_page_2$"))
